@@ -16,6 +16,8 @@
 
 from typing import Optional, Union
 
+import torch
+
 from ...image_processing_utils import BatchFeature
 from ...image_processing_utils_fast import (
     BaseImageProcessorFast,
@@ -28,24 +30,18 @@ from ...processing_utils import Unpack
 from ...utils import (
     TensorType,
     auto_docstring,
-    is_torch_available,
-    is_torchvision_available,
     is_torchvision_v2_available,
 )
 from .image_processing_got_ocr2 import get_optimal_tiled_canvas
 
 
-if is_torch_available():
-    import torch
-
-if is_torchvision_available():
-    if is_torchvision_v2_available():
-        from torchvision.transforms.v2 import functional as F
-    else:
-        from torchvision.transforms import functional as F
+if is_torchvision_v2_available():
+    from torchvision.transforms.v2 import functional as F
+else:
+    from torchvision.transforms import functional as F
 
 
-class GotOcr2ImageProcessorKwargs(DefaultFastImageProcessorKwargs):
+class GotOcr2FastImageProcessorKwargs(DefaultFastImageProcessorKwargs):
     """
     crop_to_patches (`bool`, *optional*, defaults to `False`):
         Whether to crop the image to patches. Can be overridden by the `crop_to_patches` parameter in the
@@ -76,13 +72,13 @@ class GotOcr2ImageProcessorFast(BaseImageProcessorFast):
     crop_to_patches = False
     min_patches = 1
     max_patches = 12
-    valid_kwargs = GotOcr2ImageProcessorKwargs
+    valid_kwargs = GotOcr2FastImageProcessorKwargs
 
-    def __init__(self, **kwargs: Unpack[GotOcr2ImageProcessorKwargs]):
+    def __init__(self, **kwargs: Unpack[GotOcr2FastImageProcessorKwargs]):
         super().__init__(**kwargs)
 
     @auto_docstring
-    def preprocess(self, images: ImageInput, **kwargs: Unpack[GotOcr2ImageProcessorKwargs]) -> BatchFeature:
+    def preprocess(self, images: ImageInput, **kwargs: Unpack[GotOcr2FastImageProcessorKwargs]) -> BatchFeature:
         return super().preprocess(images, **kwargs)
 
     def crop_image_to_patches(
@@ -173,6 +169,7 @@ class GotOcr2ImageProcessorFast(BaseImageProcessorFast):
         image_std: Optional[Union[float, list[float]]],
         disable_grouping: Optional[bool],
         return_tensors: Optional[Union[str, TensorType]],
+        **kwargs,
     ) -> BatchFeature:
         if crop_to_patches:
             grouped_images, grouped_images_index = group_images_by_shape(images, disable_grouping=disable_grouping)
@@ -223,7 +220,7 @@ class GotOcr2ImageProcessorFast(BaseImageProcessorFast):
             data={"pixel_values": processed_images, "num_patches": num_patches}, tensor_type=return_tensors
         )
 
-    def get_number_of_image_tokens(self, height: int, width: int, images_kwargs=None):
+    def get_number_of_image_patches(self, height: int, width: int, images_kwargs=None):
         """
         A utility that returns number patches for a given image size.
 
@@ -237,17 +234,18 @@ class GotOcr2ImageProcessorFast(BaseImageProcessorFast):
         Returns:
             `int`: Number of patches per image.
         """
-        min_patches = images_kwargs.get("min_patches", None) or self.min_patches
-        max_patches = images_kwargs.get("max_patches", None) or self.max_patches
-        patch_size = images_kwargs.get("size", None) or self.size
-        crop_to_patches = images_kwargs.get("crop_to_patches", None) or self.crop_to_patches
+        min_patches = images_kwargs.get("min_patches", self.min_patches)
+        max_patches = images_kwargs.get("max_patches", self.max_patches)
+        patch_size = images_kwargs.get("patch_size", self.size)
+        crop_to_patches = images_kwargs.get("crop_to_patches", self.crop_to_patches)
 
         num_patches = 1
         if crop_to_patches and max_patches > 1:
             num_columns, num_rows = get_optimal_tiled_canvas(
                 (height, width), (patch_size["height"], patch_size["width"]), min_patches, max_patches
             )
-            num_patches += num_columns * num_rows
+            if num_columns * num_rows > 1:
+                num_patches += num_columns * num_rows
 
         return num_patches
 

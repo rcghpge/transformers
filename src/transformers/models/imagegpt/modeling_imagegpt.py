@@ -15,16 +15,14 @@
 """PyTorch OpenAI ImageGPT model."""
 
 import math
-import os
-import warnings
 from typing import Any, Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
+from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
 from ...generation import GenerationMixin
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
@@ -43,114 +41,6 @@ from .configuration_imagegpt import ImageGPTConfig
 
 
 logger = logging.get_logger(__name__)
-
-
-def load_tf_weights_in_imagegpt(model, config, imagegpt_checkpoint_path):
-    """
-    Load tf checkpoints in a pytorch model
-    """
-    try:
-        import re
-
-        import tensorflow as tf
-    except ImportError:
-        logger.error(
-            "Loading a TensorFlow model in PyTorch, requires TensorFlow to be installed. Please see "
-            "https://www.tensorflow.org/install/ for installation instructions."
-        )
-        raise
-    tf_path = os.path.abspath(imagegpt_checkpoint_path)
-    logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
-    # Load weights from TF model
-    init_vars = tf.train.list_variables(tf_path)
-    names = []
-    arrays = []
-
-    for name, shape in init_vars:
-        logger.info(f"Loading TF weight {name} with shape {shape}")
-        array = tf.train.load_variable(tf_path, name)
-        names.append(name)
-        arrays.append(array.squeeze())
-
-    for name, array in zip(names, arrays):
-        name = name[6:]  # skip "model/"
-        name = name.split("/")
-
-        # adam_v and adam_m are variables used in AdamWeightDecayOptimizer to calculated m and v
-        # which are not required for using pretrained model
-        if any(
-            n in ["adam_v", "adam_m", "AdamWeightDecayOptimizer", "AdamWeightDecayOptimizer_1", "global_step"]
-            for n in name
-        ) or name[-1] in ["_step"]:
-            logger.info("Skipping {}".format("/".join(name)))
-            continue
-
-        pointer = model
-        if name[-1] not in ["wtet"]:
-            pointer = getattr(pointer, "transformer")
-
-        for m_name in name:
-            if re.fullmatch(r"[A-Za-z]+\d+", m_name):
-                scope_names = re.split(r"(\d+)", m_name)
-            else:
-                scope_names = [m_name]
-
-            if scope_names[0] == "w" or scope_names[0] == "g":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "b":
-                pointer = getattr(pointer, "bias")
-            elif scope_names[0] == "wpe" or scope_names[0] == "wte":
-                pointer = getattr(pointer, scope_names[0])
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] in ["q_proj", "k_proj", "v_proj"]:
-                pointer = getattr(pointer, "c_attn")
-                pointer = getattr(pointer, "weight")
-            elif len(name) == 3 and name[1] == "attn" and scope_names[0] == "c_proj":
-                pointer = getattr(pointer, scope_names[0])
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "wtet":
-                pointer = getattr(pointer, "lm_head")
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "sos":
-                pointer = getattr(pointer, "wte")
-                pointer = getattr(pointer, "weight")
-            else:
-                pointer = getattr(pointer, scope_names[0])
-            if len(scope_names) >= 2:
-                num = int(scope_names[1])
-                pointer = pointer[num]
-
-        if len(name) > 1 and name[1] == "attn" or name[-1] == "wtet" or name[-1] == "sos" or name[-1] == "wte":
-            pass  # array is used to initialize only part of the pointer so sizes won't match
-        else:
-            try:
-                assert pointer.shape == array.shape
-            except AssertionError as e:
-                e.args += (pointer.shape, array.shape)
-                raise
-
-        logger.info(f"Initialize PyTorch weight {name}")
-
-        if name[-1] == "q_proj":
-            pointer.data[:, : config.n_embd] = torch.from_numpy(array.reshape(config.n_embd, config.n_embd)).T
-        elif name[-1] == "k_proj":
-            pointer.data[:, config.n_embd : 2 * config.n_embd] = torch.from_numpy(
-                array.reshape(config.n_embd, config.n_embd)
-            ).T
-        elif name[-1] == "v_proj":
-            pointer.data[:, 2 * config.n_embd :] = torch.from_numpy(array.reshape(config.n_embd, config.n_embd)).T
-        elif len(name) == 3 and name[1] == "attn" and name[2] == "c_proj":
-            pointer.data = torch.from_numpy(array.reshape(config.n_embd, config.n_embd))
-        elif name[-1] == "wtet":
-            pointer.data = torch.from_numpy(array)
-        elif name[-1] == "wte":
-            pointer.data[: config.vocab_size - 1, :] = torch.from_numpy(array)
-        elif name[-1] == "sos":
-            pointer.data[-1] = torch.from_numpy(array)
-        else:
-            pointer.data = torch.from_numpy(array)
-
-    return model
 
 
 class ImageGPTLayerNorm(nn.Module):
@@ -334,40 +224,61 @@ class ImageGPTAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        layer_past: Optional[bool] = None,
+        layer_past: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
+        cache_position: Optional[torch.Tensor] = None,
     ) -> tuple:
-        if encoder_hidden_states is not None:
+        is_cross_attention = encoder_hidden_states is not None
+        bsz, seq_len, _ = hidden_states.shape
+
+        if layer_past is not None:
+            if isinstance(layer_past, EncoderDecoderCache):
+                is_updated = layer_past.is_updated.get(self.layer_idx)
+                if is_cross_attention:
+                    # after the first generated id, we can subsequently re-use all key/value_states from cache
+                    curr_past_key_value = layer_past.cross_attention_cache
+                else:
+                    curr_past_key_value = layer_past.self_attention_cache
+            else:
+                curr_past_key_value = layer_past
+
+        current_states = encoder_hidden_states if is_cross_attention else hidden_states
+        if is_cross_attention:
             if not hasattr(self, "q_attn"):
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
                     "Please make sure to instantiate class with `ImageGPTAttention(..., is_cross_attention=True)`."
                 )
 
-            query = self.q_attn(hidden_states)
-            key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
-            attention_mask = encoder_attention_mask
+            if layer_past is not None and is_updated:
+                # reuse k,v, cross_attentions, and compute only q
+                query = self.q_attn(hidden_states)
+                key = curr_past_key_value.layers[self.layer_idx].keys
+                value = curr_past_key_value.layers[self.layer_idx].values
+            else:
+                query = self.q_attn(hidden_states)
+                key, value = self.c_attn(current_states).split(self.split_size, dim=2)
+                key = key.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
+                value = value.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
         else:
-            query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
-
-        query = self._split_heads(query, self.num_heads, self.head_dim)
-        key = self._split_heads(key, self.num_heads, self.head_dim)
-        value = self._split_heads(value, self.num_heads, self.head_dim)
+            query, key, value = self.c_attn(current_states).split(self.split_size, dim=2)
+            key = key.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            value = value.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
         if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
+            # save all key/value_states to cache to be re-used for fast auto-regressive generation
+            cache_position = cache_position if not is_cross_attention else None
+            key, value = curr_past_key_value.update(key, value, self.layer_idx, {"cache_position": cache_position})
+            # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
+            if is_cross_attention:
+                layer_past.is_updated[self.layer_idx] = True
 
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
+        query = query.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
@@ -378,11 +289,7 @@ class ImageGPTAttention(nn.Module):
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        outputs = (attn_output, present)
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs  # a, present, (attentions)
+        return attn_output, attn_weights
 
 
 class ImageGPTMLP(nn.Module):
@@ -421,13 +328,14 @@ class ImageGPTBlock(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        layer_past: Optional[bool] = None,
+        layer_past: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
+        cache_position: Optional[torch.Tensor] = None,
     ) -> tuple:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -438,8 +346,9 @@ class ImageGPTBlock(GradientCheckpointingLayer):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            cache_position=cache_position,
         )
-        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
+        attn_output = attn_outputs[0]
         outputs = attn_outputs[1:]
         # residual connection
         hidden_states = attn_output + residual
@@ -455,16 +364,18 @@ class ImageGPTBlock(GradientCheckpointingLayer):
             hidden_states = self.ln_cross_attn(hidden_states)
             cross_attn_outputs = self.crossattention(
                 hidden_states,
+                layer_past=layer_past,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
+                cache_position=cache_position,
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
             hidden_states = residual + attn_output
-            outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
+            outputs = outputs + cross_attn_outputs[1:]  # add cross attentions if we output attention weights
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
@@ -472,15 +383,12 @@ class ImageGPTBlock(GradientCheckpointingLayer):
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
 
-        outputs = (hidden_states,) + (outputs if use_cache else outputs[1:])
-
-        return outputs  # hidden_states, present, (attentions, cross_attentions)
+        return (hidden_states,) + outputs
 
 
 @auto_docstring
 class ImageGPTPreTrainedModel(PreTrainedModel):
-    config_class = ImageGPTConfig
-    load_tf_weights = load_tf_weights_in_imagegpt
+    config: ImageGPTConfig
     base_model_prefix = "transformer"
     main_input_name = "input_ids"
     supports_gradient_checkpointing = True
@@ -492,8 +400,6 @@ class ImageGPTPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights."""
         if isinstance(module, (nn.Linear, Conv1D)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -554,7 +460,7 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -566,12 +472,13 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Union[tuple, BaseModelOutputWithPastAndCrossAttentions]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -597,19 +504,6 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
         >>> last_hidden_states = outputs.last_hidden_state
         ```"""
 
-        if "pixel_values" in kwargs:
-            warnings.warn(
-                "The `pixel_values` argument is deprecated and will be removed in v4.47, use `input_ids` instead.",
-                FutureWarning,
-            )
-
-            if input_ids is not None:
-                raise ValueError(
-                    "You cannot pass both `pixel_values` and `input_ids`. Please make sure to only pass `input_ids`."
-                )
-
-            input_ids = kwargs.pop("pixel_values")
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -632,14 +526,28 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+
+        if use_cache and past_key_values is None:
+            past_key_values = EncoderDecoderCache(DynamicCache(config=self.config), DynamicCache(config=self.config))
+        if use_cache and isinstance(past_key_values, tuple):
+            logger.warning_once(
+                "Passing a tuple of `past_key_values` is deprecated and will be removed in Transformers v4.58.0. "
+                "You should pass an instance of `EncoderDecoderCache` instead, e.g. "
+                "`past_key_values=EncoderDecoderCache.from_legacy_cache(past_key_values)`."
+            )
+            past_key_values = EncoderDecoderCache.from_legacy_cache(past_key_values)
+
+        past_length = past_key_values.get_seq_length() if past_key_values is not None else past_key_values
+
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
 
-        if past_key_values is None:
-            past_length = 0
-            past_key_values = tuple([None] * len(self.h))
-        else:
-            past_length = past_key_values[0][0].size(-2)
         if position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0)
@@ -691,27 +599,15 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
             hidden_states = hidden_states + token_type_embeds
 
         hidden_states = self.drop(hidden_states)
-
         output_shape = input_shape + (hidden_states.size(-1),)
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
-        presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+        for i, block in enumerate(self.h):
             # Model parallel
             if self.model_parallel:
                 torch.cuda.set_device(hidden_states.device)
-                # Ensure layer_past is on same device as hidden_states (might not be correct)
-                if layer_past is not None:
-                    layer_past = tuple(past_state.to(hidden_states.device) for past_state in layer_past)
                 # Ensure that attention_mask is always on the same device as hidden_states
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(hidden_states.device)
@@ -722,23 +618,21 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
 
             outputs = block(
                 hidden_states,
-                layer_past,
+                past_key_values,
                 attention_mask,
                 head_mask[i],
                 encoder_hidden_states,  # as a positional argument for gradient checkpointing
                 encoder_attention_mask=encoder_attention_mask,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
+                cache_position=cache_position,
             )
 
             hidden_states = outputs[0]
-            if use_cache is True:
-                presents = presents + (outputs[1],)
-
             if output_attentions:
-                all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+                all_self_attentions = all_self_attentions + (outputs[1],)
                 if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
+                    all_cross_attentions = all_cross_attentions + (outputs[2],)
 
             # Model Parallel: If it's the last layer for that device, put things on the next device
             if self.model_parallel:
@@ -747,8 +641,8 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
         hidden_states = self.ln_f(hidden_states)
-
         hidden_states = hidden_states.view(*output_shape)
+
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -756,13 +650,13 @@ class ImageGPTModel(ImageGPTPreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+                for v in [hidden_states, past_key_values, all_hidden_states, all_self_attentions, all_cross_attentions]
                 if v is not None
             )
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=presents,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
@@ -789,17 +683,11 @@ class ImageGPTForCausalImageModeling(ImageGPTPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
     @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -812,12 +700,13 @@ class ImageGPTForCausalImageModeling(ImageGPTPreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Union[tuple, CausalLMOutputWithCrossAttentions]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -865,19 +754,6 @@ class ImageGPTForCausalImageModeling(ImageGPTPreTrainedModel, GenerationMixin):
         ...     ax.imshow(img)
         ```"""
 
-        if "pixel_values" in kwargs:
-            warnings.warn(
-                "The `pixel_values` argument is deprecated and will be removed in v4.47, use `input_ids` instead.",
-                FutureWarning,
-            )
-
-            if input_ids is not None:
-                raise ValueError(
-                    "You cannot pass both `pixel_values` and `input_ids`. Please make sure to only pass `input_ids`."
-                )
-
-            input_ids = kwargs.pop("pixel_values")
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.transformer(
@@ -894,6 +770,7 @@ class ImageGPTForCausalImageModeling(ImageGPTPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
         hidden_states = transformer_outputs[0]
 
@@ -921,20 +798,6 @@ class ImageGPTForCausalImageModeling(ImageGPTPreTrainedModel, GenerationMixin):
             cross_attentions=transformer_outputs.cross_attentions,
         )
 
-    @staticmethod
-    def _reorder_cache(
-        past_key_values: tuple[tuple[torch.Tensor]], beam_idx: torch.Tensor
-    ) -> tuple[tuple[torch.Tensor]]:
-        """
-        This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
-        [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
-        beam_idx at every generation step.
-        """
-        return tuple(
-            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
-            for layer_past in past_key_values
-        )
-
 
 @auto_docstring(
     custom_intro="""
@@ -956,7 +819,7 @@ class ImageGPTForImageClassification(ImageGPTPreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -972,7 +835,7 @@ class ImageGPTForImageClassification(ImageGPTPreTrainedModel):
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1002,19 +865,6 @@ class ImageGPTForImageClassification(ImageGPTPreTrainedModel):
         >>> logits = outputs.logits
         ```"""
 
-        if "pixel_values" in kwargs:
-            warnings.warn(
-                "The `pixel_values` argument is deprecated and will be removed in v4.47, use `input_ids` instead.",
-                FutureWarning,
-            )
-
-            if input_ids is not None:
-                raise ValueError(
-                    "You cannot pass both `pixel_values` and `input_ids`. Please make sure to only pass `input_ids`."
-                )
-
-            input_ids = kwargs.pop("pixel_values")
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.transformer(
@@ -1038,26 +888,8 @@ class ImageGPTForImageClassification(ImageGPTPreTrainedModel):
 
         loss = None
         if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
+            loss = self.loss_function(labels, logits, self.config)
 
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
         if not return_dict:
             output = (logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
@@ -1076,5 +908,4 @@ __all__ = [
     "ImageGPTForImageClassification",
     "ImageGPTModel",
     "ImageGPTPreTrainedModel",
-    "load_tf_weights_in_imagegpt",
 ]

@@ -18,7 +18,7 @@ import io
 import pathlib
 from collections import defaultdict
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 
@@ -44,7 +44,7 @@ from ...image_utils import (
     get_image_size,
     infer_channel_dimension_format,
     is_scaled_image,
-    make_list_of_images,
+    make_flat_list_of_images,
     to_numpy_array,
     valid_images,
     validate_annotations,
@@ -54,11 +54,7 @@ from ...image_utils import (
 from ...utils import (
     ExplicitEnum,
     TensorType,
-    is_flax_available,
-    is_jax_tensor,
     is_scipy_available,
-    is_tf_available,
-    is_tf_tensor,
     is_torch_available,
     is_torch_tensor,
     is_vision_available,
@@ -200,31 +196,6 @@ def get_image_size_for_max_height_width(
     return new_height, new_width
 
 
-# Copied from transformers.models.detr.image_processing_detr.get_numpy_to_framework_fn
-def get_numpy_to_framework_fn(arr) -> Callable:
-    """
-    Returns a function that converts a numpy array to the framework of the input array.
-
-    Args:
-        arr (`np.ndarray`): The array to convert.
-    """
-    if isinstance(arr, np.ndarray):
-        return np.array
-    if is_tf_available() and is_tf_tensor(arr):
-        import tensorflow as tf
-
-        return tf.convert_to_tensor
-    if is_torch_available() and is_torch_tensor(arr):
-        import torch
-
-        return torch.tensor
-    if is_flax_available() and is_jax_tensor(arr):
-        import jax.numpy as jnp
-
-        return jnp.array
-    raise ValueError(f"Cannot convert arrays of type {type(arr)}")
-
-
 # Copied from transformers.models.detr.image_processing_detr.safe_squeeze
 def safe_squeeze(arr: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
     """
@@ -359,7 +330,7 @@ def prepare_coco_detection_annotation(
 
     # for conversion to coco api
     area = np.asarray([obj["area"] for obj in annotations], dtype=np.float32)
-    iscrowd = np.asarray([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in annotations], dtype=np.int64)
+    iscrowd = np.asarray([obj.get("iscrowd", 0) for obj in annotations], dtype=np.int64)
 
     boxes = [obj["bbox"] for obj in annotations]
     # guard against no boxes via resizing
@@ -537,7 +508,7 @@ def post_process_panoptic_sample(
         masks (`torch.Tensor`):
             The predicted segmentation masks for this sample.
         boxes (`torch.Tensor`):
-            The prediced bounding boxes for this sample. The boxes are in the normalized format `(center_x, center_y,
+            The predicted bounding boxes for this sample. The boxes are in the normalized format `(center_x, center_y,
             width, height)` and values between `[0, 1]`, relative to the size the image (disregarding padding).
         processed_size (`tuple[int, int]`):
             The processed size of the image `(height, width)`, as returned by the preprocessing step i.e. the size
@@ -831,7 +802,7 @@ def _scale_boxes(boxes, target_sizes):
     elif isinstance(target_sizes, torch.Tensor):
         image_height, image_width = target_sizes.unbind(1)
     else:
-        raise ValueError("`target_sizes` must be a list, tuple or torch.Tensor")
+        raise TypeError("`target_sizes` must be a list, tuple or torch.Tensor")
 
     scale_factor = torch.stack([image_width, image_height, image_width, image_height], dim=1)
     scale_factor = scale_factor.unsqueeze(1).to(boxes.device)
@@ -1241,10 +1212,8 @@ class GroundingDinoImageProcessor(BaseImageProcessor):
             return_tensors (`str` or `TensorType`, *optional*):
                 The type of tensors to return. Can be one of:
                     - Unset: Return a list of `np.ndarray`.
-                    - `TensorType.TENSORFLOW` or `'tf'`: Return a batch of type `tf.Tensor`.
                     - `TensorType.PYTORCH` or `'pt'`: Return a batch of type `torch.Tensor`.
                     - `TensorType.NUMPY` or `'np'`: Return a batch of type `np.ndarray`.
-                    - `TensorType.JAX` or `'jax'`: Return a batch of type `jax.numpy.ndarray`.
             data_format (`str` or `ChannelDimension`, *optional*):
                 The channel dimension format of the image. If not provided, it will be the same as the input image.
             input_data_format (`ChannelDimension` or `str`, *optional*):
@@ -1426,13 +1395,10 @@ class GroundingDinoImageProcessor(BaseImageProcessor):
         pad_size = self.pad_size if pad_size is None else pad_size
         format = self.format if format is None else format
 
-        images = make_list_of_images(images)
+        images = make_flat_list_of_images(images)
 
         if not valid_images(images):
-            raise ValueError(
-                "Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, "
-                "torch.Tensor, tf.Tensor or jax.ndarray."
-            )
+            raise ValueError("Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, or torch.Tensor.")
         validate_kwargs(captured_kwargs=kwargs.keys(), valid_processor_keys=self._valid_processor_keys)
 
         # Here, the pad() method pads to the maximum of (width, height). It does not need to be validated.

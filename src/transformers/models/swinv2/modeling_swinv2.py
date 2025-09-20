@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from ...activations import ACT2FN
@@ -183,11 +182,6 @@ def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = Fals
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
-    Comment by Ross Wightman: This is the same as the DropConnect impl I created for EfficientNet, etc networks,
-    however, the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for changing the
-    layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use 'survival rate' as the
-    argument.
     """
     if drop_prob == 0.0 or not training:
         return input
@@ -385,7 +379,7 @@ class Swinv2PatchMerging(nn.Module):
         batch_size, dim, num_channels = input_feature.shape
 
         input_feature = input_feature.view(batch_size, height, width, num_channels)
-        # pad input to be disible by width and height, if needed
+        # pad input to be divisible by width and height, if needed
         input_feature = self.maybe_pad(input_feature, height, width)
         # [batch_size, height/2, width/2, num_channels]
         input_feature_0 = input_feature[:, 0::2, 0::2, :]
@@ -467,11 +461,6 @@ class Swinv2SelfAttention(nn.Module):
         self.value = nn.Linear(self.all_head_size, self.all_head_size, bias=config.qkv_bias)
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -480,11 +469,21 @@ class Swinv2SelfAttention(nn.Module):
         output_attentions: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
         batch_size, dim, num_channels = hidden_states.shape
-        mixed_query_layer = self.query(hidden_states)
-
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        query_layer = (
+            self.query(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_layer = (
+            self.key(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         # cosine attention
         attention_scores = nn.functional.normalize(query_layer, dim=-1) @ nn.functional.normalize(
@@ -914,7 +913,7 @@ class Swinv2Encoder(nn.Module):
 
 @auto_docstring
 class Swinv2PreTrainedModel(PreTrainedModel):
-    config_class = Swinv2Config
+    config: Swinv2Config
     base_model_prefix = "swinv2"
     main_input_name = "pixel_values"
     supports_gradient_checkpointing = True
@@ -923,8 +922,6 @@ class Swinv2PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -1222,7 +1219,7 @@ class Swinv2ForImageClassification(Swinv2PreTrainedModel):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, pooled_logits=logits, config=self.config)
+            loss = self.loss_function(labels, logits, self.config)
 
         if not return_dict:
             output = (logits,) + outputs[2:]

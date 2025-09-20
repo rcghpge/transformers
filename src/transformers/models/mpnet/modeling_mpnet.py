@@ -43,14 +43,12 @@ logger = logging.get_logger(__name__)
 
 @auto_docstring
 class MPNetPreTrainedModel(PreTrainedModel):
-    config_class = MPNetConfig
+    config: MPNetConfig
     base_model_prefix = "mpnet"
 
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -144,11 +142,6 @@ class MPNetSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
     def forward(
         self,
         hidden_states,
@@ -158,13 +151,22 @@ class MPNetSelfAttention(nn.Module):
         output_attentions=False,
         **kwargs,
     ):
-        q = self.q(hidden_states)
-        k = self.k(hidden_states)
-        v = self.v(hidden_states)
-
-        q = self.transpose_for_scores(q)
-        k = self.transpose_for_scores(k)
-        v = self.transpose_for_scores(v)
+        batch_size, seq_length, _ = hidden_states.shape
+        q = (
+            self.q(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(q, k.transpose(-1, -2))

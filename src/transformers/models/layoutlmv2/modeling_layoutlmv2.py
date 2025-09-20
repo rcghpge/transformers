@@ -18,7 +18,6 @@ import math
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
@@ -123,11 +122,6 @@ class LayoutLMv2SelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
     def compute_qkv(self, hidden_states):
         if self.fast_qkv:
             qkv = self.qkv_linear(hidden_states)
@@ -154,12 +148,13 @@ class LayoutLMv2SelfAttention(nn.Module):
         rel_pos=None,
         rel_2d_pos=None,
     ):
-        q, k, v = self.compute_qkv(hidden_states)
+        batch_size, seq_length, _ = hidden_states.shape
+        query, key, value = self.compute_qkv(hidden_states)
 
         # (B, L, H*D) -> (B, H, L, D)
-        query_layer = self.transpose_for_scores(q)
-        key_layer = self.transpose_for_scores(k)
-        value_layer = self.transpose_for_scores(v)
+        query_layer = query.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        key_layer = key.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        value_layer = value.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
 
         query_layer = query_layer / math.sqrt(self.attention_head_size)
         # [BSZ, NAT, L, L]
@@ -472,14 +467,12 @@ class LayoutLMv2Encoder(nn.Module):
 
 @auto_docstring
 class LayoutLMv2PreTrainedModel(PreTrainedModel):
-    config_class = LayoutLMv2Config
+    config: LayoutLMv2Config
     base_model_prefix = "layoutlmv2"
 
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()

@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 
 from ...activations import ACT2FN
@@ -39,9 +38,11 @@ from ...pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and
 from ...utils import (
     ModelOutput,
     auto_docstring,
+    can_return_tuple,
     logging,
     torch_int,
 )
+from ...utils.deprecation import deprecate_kwarg
 from .configuration_git import GitConfig, GitVisionConfig
 
 
@@ -75,8 +76,6 @@ class GitEmbeddings(nn.Module):
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
@@ -150,41 +149,48 @@ class GitSelfAttention(nn.Module):
             self.max_position_embeddings = config.max_position_embeddings
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
-    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         pixel_values_present: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
-        mixed_query_layer = self.query(hidden_states)
+        batch_size, seq_length, _ = hidden_states.shape
+        query_layer = (
+            self.query(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         cutoff = self.image_patch_tokens if pixel_values_present else 0
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        if past_key_value is not None:
+        key_layer = (
+            self.key(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        if past_key_values is not None:
             # NOTE: like in other caches, we store the text component. In GIT it means we discard the image component.
-            key_layer_past, value_layer_past = past_key_value.update(
+            key_layer_past, value_layer_past = past_key_values.update(
                 key_layer[:, :, cutoff:, :], value_layer[:, :, cutoff:, :], self.layer_idx
             )
             key_layer = torch.cat([key_layer[:, :, :cutoff, :], key_layer_past], dim=2)
             value_layer = torch.cat([value_layer[:, :, :cutoff, :], value_layer_past], dim=2)
-
-        query_layer = self.transpose_for_scores(mixed_query_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             query_length, key_length = query_layer.shape[2], key_layer.shape[2]
-            if past_key_value is not None:
+            if past_key_values is not None:
                 position_ids_l = torch.tensor(key_length - 1, dtype=torch.long, device=hidden_states.device).view(
                     -1, 1
                 )
@@ -226,10 +232,7 @@ class GitSelfAttention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
-
-        outputs = outputs + (past_key_value,)
-        return outputs
+        return context_layer, attention_probs
 
 
 # Copied from transformers.models.bert.modeling_bert.BertSelfOutput
@@ -280,26 +283,26 @@ class GitAttention(nn.Module):
         self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
         self.pruned_heads = self.pruned_heads.union(heads)
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         pixel_values_present: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
-        self_outputs = self.self(
+        attn_output, self_attn_weights = self.self(
             hidden_states,
             attention_mask,
             head_mask,
-            past_key_value,
+            past_key_values,
             output_attentions,
             pixel_values_present,
         )
-        attention_output = self.output(self_outputs[0], hidden_states)
-        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
-        return outputs
+        attention_output = self.output(attn_output, hidden_states)
+        return attention_output, self_attn_weights
 
 
 # Copied from transformers.models.bert.modeling_bert.BertIntermediate
@@ -342,39 +345,30 @@ class GitLayer(GradientCheckpointingLayer):
         self.intermediate = GitIntermediate(config)
         self.output = GitOutput(config)
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         pixel_values_present: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
-        self_attention_outputs = self.attention(
+        attention_output, self_attention_weights = self.attention(
             hidden_states,
             attention_mask,
             head_mask,
             output_attentions=output_attentions,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             pixel_values_present=pixel_values_present,
         )
-        attention_output = self_attention_outputs[0]
-
-        # if decoder, the last output is tuple of self-attn cache
-        outputs = self_attention_outputs[1:-1]
-        present_key_value = self_attention_outputs[-1]
 
         layer_output = apply_chunking_to_forward(
             self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
         )
-        outputs = (layer_output,) + outputs
-
-        # if decoder, return the attn key/values as the last output
-        outputs = outputs + (present_key_value,)
-
-        return outputs
+        return layer_output, self_attention_weights
 
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
@@ -408,23 +402,11 @@ class GitEncoder(nn.Module):
                 )
                 use_cache = False
 
-        # kept for BC (non `Cache` `past_key_values` inputs)
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
-            return_legacy_cache = True
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                logger.warning_once(
-                    "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-                    "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-                    "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
-                )
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
-        next_decoder_cache = None
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -441,24 +423,18 @@ class GitEncoder(nn.Module):
             )
 
             hidden_states = layer_outputs[0]
-            if use_cache:
-                next_decoder_cache = layer_outputs[-1]
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-        if return_legacy_cache:
-            next_cache = next_cache.to_legacy_cache()
-
         if not return_dict:
             return tuple(
                 v
                 for v in [
                     hidden_states,
-                    next_cache,
+                    past_key_values,
                     all_hidden_states,
                     all_self_attentions,
                 ]
@@ -466,7 +442,7 @@ class GitEncoder(nn.Module):
             )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
@@ -474,11 +450,9 @@ class GitEncoder(nn.Module):
 
 @auto_docstring
 class GitPreTrainedModel(PreTrainedModel):
-    config_class = GitConfig
+    config: GitConfig
     base_model_prefix = "git"
     supports_gradient_checkpointing = True
-    _supports_cache_class = True
-    _supports_quantized_cache = True
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -487,8 +461,6 @@ class GitPreTrainedModel(PreTrainedModel):
             nn.init.normal_(module.patch_embedding.weight, std=self.config.initializer_range)
             nn.init.normal_(module.position_embedding.weight, std=self.config.initializer_range)
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -677,13 +649,7 @@ class GitVisionAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and output_attentions:
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -770,6 +736,7 @@ class GitVisionEncoder(nn.Module):
         self.layers = nn.ModuleList([GitVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
+    @can_return_tuple
     def forward(
         self,
         inputs_embeds,
@@ -836,8 +803,6 @@ class GitVisionEncoder(nn.Module):
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 
-        if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
         return BaseModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
         )
@@ -903,7 +868,7 @@ class GitVisionTransformer(nn.Module):
     """
 )
 class GitVisionModel(GitPreTrainedModel):
-    config_class = GitVisionConfig
+    config: GitVisionConfig
     main_input_name = "pixel_values"
 
     # Copied from transformers.models.clip.modeling_clip.CLIPVisionModel.__init__ with CLIP->Git
@@ -985,7 +950,7 @@ class GitModel(GitPreTrainedModel):
         self.visual_projection = GitProjection(config)
 
         if config.num_image_with_embedding is not None:
-            self.img_temperal_embedding = nn.ParameterList(
+            self.img_temporal_embedding = nn.ParameterList(
                 nn.Parameter(torch.zeros(1, 1, config.vision_config.hidden_size))
                 for _ in range(config.num_image_with_embedding)
             )
@@ -1123,7 +1088,7 @@ class GitModel(GitPreTrainedModel):
         past_key_values_length = 0
         if past_key_values is not None:
             past_key_values_length = (
-                past_key_values[0][0].shape[2]
+                past_key_values.get_seq_length()
                 if not isinstance(past_key_values, Cache)
                 else past_key_values.get_seq_length()
             )
@@ -1150,7 +1115,7 @@ class GitModel(GitPreTrainedModel):
                     visual_features_frame = self.image_encoder(
                         pixel_values[:, frame_idx, :, :], interpolate_pos_encoding=interpolate_pos_encoding
                     ).last_hidden_state
-                    visual_features_frame += self.img_temperal_embedding[frame_idx]
+                    visual_features_frame += self.img_temporal_embedding[frame_idx]
                     visual_features.append(visual_features_frame)
 
                 # finally, concatenate all features along sequence dimension
@@ -1472,21 +1437,20 @@ class GitForCausalLM(GitPreTrainedModel, GenerationMixin):
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_shape)
 
-        return {
+        model_inputs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "pixel_values": kwargs.get("pixel_values", None),
+            "pixel_values": kwargs.get("pixel_values"),
             "past_key_values": past_key_values,
             "use_cache": use_cache,
         }
 
-    def _reorder_cache(self, past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
-            )
-        return reordered_past
+        # Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
+        for key, value in kwargs.items():
+            if key not in model_inputs:
+                model_inputs[key] = value
+
+        return model_inputs
 
 
 __all__ = ["GitForCausalLM", "GitModel", "GitPreTrainedModel", "GitVisionModel"]

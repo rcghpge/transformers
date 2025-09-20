@@ -102,7 +102,7 @@ class Gemma3ImageProcessor(BaseImageProcessor):
         do_normalize: bool = True,
         image_mean: Optional[Union[float, list[float]]] = None,
         image_std: Optional[Union[float, list[float]]] = None,
-        do_convert_rgb: Optional[bool] = None,
+        do_convert_rgb: Optional[bool] = True,
         do_pan_and_scan: Optional[bool] = None,
         pan_and_scan_min_crop_size: Optional[int] = None,
         pan_and_scan_max_num_crops: Optional[int] = None,
@@ -242,7 +242,7 @@ class Gemma3ImageProcessor(BaseImageProcessor):
         images: ImageInput,
         do_resize: Optional[bool] = None,
         size: Optional[dict[str, int]] = None,
-        resample: PILImageResampling = None,
+        resample: Optional[PILImageResampling] = None,
         do_rescale: Optional[bool] = None,
         rescale_factor: Optional[float] = None,
         do_normalize: Optional[bool] = None,
@@ -285,10 +285,8 @@ class Gemma3ImageProcessor(BaseImageProcessor):
             return_tensors (`str` or `TensorType`, *optional*):
                 The type of tensors to return. Can be one of:
                 - Unset: Return a list of `np.ndarray`.
-                - `TensorType.TENSORFLOW` or `'tf'`: Return a batch of type `tf.Tensor`.
                 - `TensorType.PYTORCH` or `'pt'`: Return a batch of type `torch.Tensor`.
                 - `TensorType.NUMPY` or `'np'`: Return a batch of type `np.ndarray`.
-                - `TensorType.JAX` or `'jax'`: Return a batch of type `jax.numpy.ndarray`.
             data_format (`ChannelDimension` or `str`, *optional*, defaults to `ChannelDimension.FIRST`):
                 The channel dimension format for the output image. Can be one of:
                 - `"channels_first"` or `ChannelDimension.FIRST`: image in (num_channels, height, width) format.
@@ -302,7 +300,7 @@ class Gemma3ImageProcessor(BaseImageProcessor):
                 - `"none"` or `ChannelDimension.NONE`: image in (height, width) format.
             do_convert_rgb (`bool`, *optional*, defaults to `self.do_convert_rgb`):
                 Whether to convert the image to RGB.
-            do_pan_and_scan (`bool`, *optional*, defaults to `self.do_convert_rgb`):
+            do_pan_and_scan (`bool`, *optional*, defaults to `self.do_pan_and_scan`):
                 Whether to apply `pan_and_scan` to images.
             pan_and_scan_min_crop_size (`int`, *optional*, defaults to `self.pan_and_scan_min_crop_size`):
                 Minimum size of each crop in pan and scan.
@@ -334,13 +332,11 @@ class Gemma3ImageProcessor(BaseImageProcessor):
             else self.pan_and_scan_min_ratio_to_activate
         )
 
+        images = self.fetch_images(images)
         images = make_flat_list_of_images(images)
 
         if not valid_images(images):
-            raise ValueError(
-                "Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, "
-                "torch.Tensor, tf.Tensor or jax.ndarray."
-            )
+            raise ValueError("Invalid image type. Must be of type PIL.Image.Image, numpy.ndarray, or torch.Tensor")
 
         validate_preprocess_arguments(
             do_rescale=do_rescale,

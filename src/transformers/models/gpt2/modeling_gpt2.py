@@ -16,20 +16,19 @@
 """PyTorch OpenAI GPT-2 model."""
 
 import math
-import os
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN, get_activation
-from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache, StaticCache
+from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
 from ...generation import GenerationMixin
-from ...modeling_attn_mask_utils import AttentionMaskConverter, _prepare_4d_attention_mask_for_sdpa
+from ...masking_utils import create_causal_mask
+from ...modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -52,62 +51,6 @@ from .configuration_gpt2 import GPT2Config
 
 
 logger = logging.get_logger(__name__)
-
-
-def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
-    """Load tf checkpoints in a pytorch model"""
-    try:
-        import re
-
-        import tensorflow as tf
-    except ImportError:
-        logger.error(
-            "Loading a TensorFlow model in PyTorch, requires TensorFlow to be installed. Please see "
-            "https://www.tensorflow.org/install/ for installation instructions."
-        )
-        raise
-    tf_path = os.path.abspath(gpt2_checkpoint_path)
-    logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
-    # Load weights from TF model
-    init_vars = tf.train.list_variables(tf_path)
-    names = []
-    arrays = []
-    for name, shape in init_vars:
-        logger.info(f"Loading TF weight {name} with shape {shape}")
-        array = tf.train.load_variable(tf_path, name)
-        names.append(name)
-        arrays.append(array.squeeze())
-
-    for name, array in zip(names, arrays):
-        name = name[6:]  # skip "model/"
-        name = name.split("/")
-        pointer = model
-        for m_name in name:
-            if re.fullmatch(r"[A-Za-z]+\d+", m_name):
-                scope_names = re.split(r"(\d+)", m_name)
-            else:
-                scope_names = [m_name]
-            if scope_names[0] == "w" or scope_names[0] == "g":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "b":
-                pointer = getattr(pointer, "bias")
-            elif scope_names[0] == "wpe" or scope_names[0] == "wte":
-                pointer = getattr(pointer, scope_names[0])
-                pointer = getattr(pointer, "weight")
-            else:
-                pointer = getattr(pointer, scope_names[0])
-            if len(scope_names) >= 2:
-                num = int(scope_names[1])
-                pointer = pointer[num]
-        try:
-            if pointer.shape != array.shape:
-                raise ValueError(f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched")
-        except ValueError as e:
-            e.args += (pointer.shape, array.shape)
-            raise
-        logger.info(f"Initialize PyTorch weight {name}")
-        pointer.data = torch.from_numpy(array)
-    return model
 
 
 def eager_attention_forward(module, query, key, value, attention_mask, head_mask=None, **kwargs):
@@ -266,11 +209,11 @@ class GPT2Attention(nn.Module):
 
         return attn_output, attn_weights
 
-    @deprecate_kwarg("layer_past", new_name="past_key_value", version="4.53.0", raise_if_both_names=True)
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: Optional[tuple[torch.FloatTensor]],
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
@@ -280,53 +223,62 @@ class GPT2Attention(nn.Module):
         **kwargs,
     ) -> tuple[Union[torch.Tensor, tuple[torch.Tensor]], ...]:
         is_cross_attention = encoder_hidden_states is not None
+        if past_key_values is not None:
+            if isinstance(past_key_values, EncoderDecoderCache):
+                is_updated = past_key_values.is_updated.get(self.layer_idx)
+                if is_cross_attention:
+                    # after the first generated id, we can subsequently re-use all key/value_layer from cache
+                    curr_past_key_value = past_key_values.cross_attention_cache
+                else:
+                    curr_past_key_value = past_key_values.self_attention_cache
+            else:
+                curr_past_key_value = past_key_values
+
         if is_cross_attention:
             if not hasattr(self, "q_attn"):
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
                     "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
                 )
-
             query_states = self.q_attn(hidden_states)
-            key_states, value_states = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
+
+            # Try to get key/value states from cache if possible
+            if past_key_values is not None and is_updated:
+                key_states = curr_past_key_value.layers[self.layer_idx].keys
+                value_states = curr_past_key_value.layers[self.layer_idx].values
+            else:
+                key_states, value_states = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
+                shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
+                key_states = key_states.view(shape_kv).transpose(1, 2)
+                value_states = value_states.view(shape_kv).transpose(1, 2)
         else:
             query_states, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
+            key_states = key_states.view(shape_kv).transpose(1, 2)
+            value_states = value_states.view(shape_kv).transpose(1, 2)
 
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
-        shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
-
         query_states = query_states.view(shape_q).transpose(1, 2)
-        key_states = key_states.view(shape_kv).transpose(1, 2)
-        value_states = value_states.view(shape_kv).transpose(1, 2)
 
-        if past_key_value is not None:
-            if isinstance(past_key_value, EncoderDecoderCache):
-                if is_cross_attention:
-                    past_key_value = past_key_value.cross_attention_cache
-                else:
-                    past_key_value = past_key_value.self_attention_cache
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs=cache_kwargs
+        if (past_key_values is not None and not is_cross_attention) or (
+            past_key_values is not None and is_cross_attention and not is_updated
+        ):
+            # save all key/value_layer to cache to be re-used for fast auto-regressive generation
+            cache_position = cache_position if not is_cross_attention else None
+            key_states, value_states = curr_past_key_value.update(
+                key_states, value_states, self.layer_idx, {"cache_position": cache_position}
             )
+            # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
+            if is_cross_attention:
+                past_key_values.is_updated[self.layer_idx] = True
 
         is_causal = attention_mask is None and query_states.shape[-2] > 1 and not is_cross_attention
 
         using_eager = self.config._attn_implementation == "eager"
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and (output_attentions or head_mask is not None):
-                using_eager = True
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                # Attention functions are consistent with previous equivalent attention classes, however they do not support some options
-                # (e.g. layer scaling, head mask) that eager supports. These implementations are thus equivalent to previous code, but
-                # not necessarily to eager (if mentioned options are provided).
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         if using_eager and self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(
@@ -385,11 +337,11 @@ class GPT2Block(GradientCheckpointingLayer):
 
         self.mlp = GPT2MLP(inner_dim, config)
 
-    @deprecate_kwarg("layer_past", new_name="past_key_value", version="4.53.0", raise_if_both_names=True)
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: Optional[tuple[torch.FloatTensor]],
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
@@ -403,7 +355,7 @@ class GPT2Block(GradientCheckpointingLayer):
         hidden_states = self.ln_1(hidden_states)
         attn_output, self_attn_weights = self.attn(
             hidden_states,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             cache_position=cache_position,
             attention_mask=attention_mask,
             head_mask=head_mask,
@@ -425,7 +377,7 @@ class GPT2Block(GradientCheckpointingLayer):
             hidden_states = self.ln_cross_attn(hidden_states)
             cross_attn_output, cross_attn_weights = self.crossattention(
                 hidden_states,
-                past_key_value=past_key_value,
+                past_key_values=past_key_values,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
                 encoder_hidden_states=encoder_hidden_states,
@@ -552,18 +504,17 @@ class GPT2SequenceSummary(nn.Module):
 
 @auto_docstring
 class GPT2PreTrainedModel(PreTrainedModel):
-    config_class = GPT2Config
-    load_tf_weights = load_tf_weights_in_gpt2
+    config: GPT2Config
     base_model_prefix = "transformer"
     is_parallelizable = True
     supports_gradient_checkpointing = True
     _no_split_modules = ["GPT2Block"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_attention_backend = True
-    _supports_cache_class = True
-    _supports_static_cache = True
+
+    _can_compile_fullgraph = True
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
@@ -571,8 +522,6 @@ class GPT2PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights."""
         if isinstance(module, (nn.Linear, Conv1D)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -612,9 +561,8 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
     mc_logits (`torch.FloatTensor` of shape `(batch_size, num_choices)`):
         Prediction scores of the multiple choice classification head (scores for each choice before SoftMax).
-    past_key_values (`tuple[tuple[torch.Tensor]]`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-        Tuple of length `config.n_layers`, containing tuples of tensors of shape `(batch_size, num_heads,
-        sequence_length, embed_size_per_head)`).
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
         Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
         `past_key_values` input) to speed up sequential decoding.
@@ -624,7 +572,7 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
     mc_loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     mc_logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[tuple[tuple[torch.FloatTensor]]] = None
+    past_key_values: Optional[Cache] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
 
@@ -721,7 +669,7 @@ class GPT2Model(GPT2PreTrainedModel):
         )
         assert_device_map(self.device_map, len(self.h))
         self.model_parallel = True
-        self.first_device = "cpu" if "cpu" in self.device_map.keys() else "cuda:" + str(min(self.device_map.keys()))
+        self.first_device = "cpu" if "cpu" in self.device_map else "cuda:" + str(min(self.device_map.keys()))
         self.last_device = "cuda:" + str(max(self.device_map.keys()))
         self.wte = self.wte.to(self.first_device)
         self.wpe = self.wpe.to(self.first_device)
@@ -767,7 +715,7 @@ class GPT2Model(GPT2PreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[tuple[tuple[torch.Tensor]], Cache]] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
@@ -785,7 +733,7 @@ class GPT2Model(GPT2PreTrainedModel):
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -829,13 +777,10 @@ class GPT2Model(GPT2PreTrainedModel):
                 use_cache = False
 
         # based on pattern from src/transformers/models/whisper/modeling_whisper.py::WhisperDecoder
-        return_legacy_cache = False
         if use_cache:
             if past_key_values is None:
-                return_legacy_cache = True
-                past_key_values = DynamicCache()
-            elif not isinstance(past_key_values, Cache):
-                return_legacy_cache = True
+                past_key_values = DynamicCache(config=self.config)
+            elif isinstance(past_key_values, tuple):
                 logger.warning_once(
                     "Passing a tuple of `past_key_values` is deprecated and will be removed in Transformers v4.53.0. "
                     "You should pass an instance of `Cache` instead, e.g. "
@@ -844,7 +789,7 @@ class GPT2Model(GPT2PreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
 
             if self.config.add_cross_attention and not isinstance(past_key_values, EncoderDecoderCache):
-                past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
+                past_key_values = EncoderDecoderCache(past_key_values, DynamicCache(config=self.config))
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
@@ -864,8 +809,14 @@ class GPT2Model(GPT2PreTrainedModel):
         # ._update_causal_mask() and ._prepare_4d_causal_attention_mask_with_cache_position() copied from LlamaModel
         if attention_mask is not None and attention_mask.ndim < 4:
             attention_mask = attention_mask.view(batch_size, -1)
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
         )
 
         # If a 2D or 3D attention mask is provided for the cross-attention
@@ -880,7 +831,7 @@ class GPT2Model(GPT2PreTrainedModel):
                 encoder_attention_mask = _prepare_4d_attention_mask_for_sdpa(
                     mask=encoder_attention_mask, dtype=inputs_embeds.dtype, tgt_len=input_shape[-1]
                 )
-            elif not self._attn_implementation == "flash_attention_2":
+            elif self._attn_implementation != "flash_attention_2":
                 encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
         else:
             encoder_attention_mask = None
@@ -906,9 +857,6 @@ class GPT2Model(GPT2PreTrainedModel):
             # Model parallel
             if self.model_parallel:
                 torch.cuda.set_device(hidden_states.device)
-                # Ensure that attention_mask is always on the same device as hidden_states
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(hidden_states.device)
                 if isinstance(head_mask, torch.Tensor):
                     head_mask = head_mask.to(hidden_states.device)
             if output_hidden_states:
@@ -948,12 +896,6 @@ class GPT2Model(GPT2PreTrainedModel):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         past_key_values = past_key_values if use_cache else None
-        if return_legacy_cache:
-            past_key_values = (
-                past_key_values.self_attention_cache.to_legacy_cache()
-                if self.config.add_cross_attention
-                else past_key_values.to_legacy_cache()
-            )
         if not return_dict:
             return tuple(
                 v
@@ -968,123 +910,6 @@ class GPT2Model(GPT2PreTrainedModel):
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
         )
-
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: Cache,
-        output_attentions: bool,
-    ):
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
-
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        using_static_cache = isinstance(past_key_values, StaticCache)
-
-        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                is_training=self.training,
-            ):
-                return None
-
-        dtype = input_tensor.dtype
-        sequence_length = input_tensor.shape[1]
-        if using_static_cache:
-            target_length = past_key_values.get_max_cache_shape()
-        else:
-            target_length = (
-                attention_mask.shape[-1]
-                if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
-            )
-
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-        )
-
-        if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type == "cuda"
-            and not output_attentions
-        ):
-            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
-            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
-            # Details: https://github.com/pytorch/pytorch/issues/110213
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-        return causal_mask
-
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        **kwargs,
-    ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
-                `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache,
-                to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
-            )
-            if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
-
-        return causal_mask
 
 
 @auto_docstring(
@@ -1139,17 +964,11 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         self.model_parallel = False
         torch.cuda.empty_cache()
 
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
     @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
@@ -1169,7 +988,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1294,17 +1113,11 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
         self.model_parallel = False
         torch.cuda.empty_cache()
 
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
     @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
@@ -1323,7 +1136,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1424,20 +1237,6 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel, GenerationMixin):
             attentions=transformer_outputs.attentions,
         )
 
-    @staticmethod
-    def _reorder_cache(
-        past_key_values: tuple[tuple[torch.Tensor]], beam_idx: torch.Tensor
-    ) -> tuple[tuple[torch.Tensor]]:
-        """
-        This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
-        [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
-        beam_idx at every generation step.
-        """
-        return tuple(
-            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
-            for layer_past in past_key_values
-        )
-
 
 @auto_docstring(
     custom_intro="""
@@ -1471,7 +1270,7 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1486,7 +1285,7 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1604,7 +1403,7 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1619,7 +1418,7 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1705,7 +1504,7 @@ class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
-            `past_key_values[0][0].shape[-2]` (`sequence_length` of input past key value states). Indices of input
+            `past_key_values.get_seq_length()` (`sequence_length` of input past key value states). Indices of input
             sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1775,5 +1574,4 @@ __all__ = [
     "GPT2LMHeadModel",
     "GPT2Model",
     "GPT2PreTrainedModel",
-    "load_tf_weights_in_gpt2",
 ]

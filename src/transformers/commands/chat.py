@@ -14,6 +14,7 @@
 
 
 import asyncio
+import copy
 import json
 import os
 import platform
@@ -21,9 +22,10 @@ import re
 import string
 import time
 from argparse import ArgumentParser, Namespace
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from threading import Thread
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 import yaml
 from huggingface_hub import AsyncInferenceClient, ChatCompletionStreamOutput
@@ -37,6 +39,12 @@ from transformers.commands import BaseTransformersCLICommand
 from transformers.commands.serving import ServeArguments, ServeCommand
 from transformers.utils import is_rich_available, is_torch_available
 
+
+try:
+    import readline  # noqa importing this enables GNU readline capabilities
+except ImportError:
+    # some platforms may not support readline: https://docs.python.org/3/library/readline.html
+    pass
 
 if platform.system() != "Windows":
     import pwd
@@ -127,7 +135,6 @@ class RichInterface:
             text = ""
             async for token in await stream:
                 outputs = token.choices[0].delta.content
-                request_id = token.id
 
                 if not outputs:
                     continue
@@ -166,7 +173,7 @@ class RichInterface:
 
         self._console.print()
 
-        return text, request_id
+        return text
 
     def input(self) -> str:
         """Gets user input from the console."""
@@ -244,8 +251,15 @@ class ChatArguments:
         default="main",
         metadata={"help": "Specific model version to use (can be a branch name, tag name or commit id)."},
     )
-    device: str = field(default="cpu", metadata={"help": "Device to use for inference."})
+    device: str = field(default="auto", metadata={"help": "Device to use for inference."})
     torch_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "`torch_dtype` is deprecated! Please use `dtype` argument instead.",
+            "choices": ["auto", "bfloat16", "float16", "float32"],
+        },
+    )
+    dtype: Optional[str] = field(
         default="auto",
         metadata={
             "help": "Override the default `torch.dtype` and load the model under this dtype. If `'auto'` is passed, "
@@ -277,6 +291,18 @@ class ChatArguments:
     # Serving settings
     host: str = field(default="localhost", metadata={"help": "Interface the server will listen to.."})
     port: int = field(default=8000, metadata={"help": "Port the server will listen to."})
+
+    def __post_init__(self):
+        """Only used for BC `torch_dtype` argument."""
+        # In this case only the BC torch_dtype was given
+        if self.torch_dtype is not None:
+            if self.dtype is None:
+                self.dtype = self.torch_dtype
+            elif self.torch_dtype != self.dtype:
+                raise ValueError(
+                    f"`torch_dtype` {self.torch_dtype} and `dtype` {self.dtype} have different values. `torch_dtype` is deprecated and "
+                    "will be removed in 4.59.0, please set `dtype` instead."
+                )
 
 
 def chat_command_factory(args: Namespace):
@@ -333,6 +359,11 @@ class ChatCommand(BaseTransformersCLICommand):
                     )
 
                 args.host, args.port = args.model_name_or_path_or_address.rsplit(":", 1)
+
+                if args.model_name_or_path is None:
+                    raise ValueError(
+                        "When connecting to a server, please specify a model name with the --model_name_or_path flag."
+                    )
             else:
                 self.spawn_backend = True
                 args.model_name_or_path = args.model_name_or_path_or_address
@@ -420,7 +451,7 @@ class ChatCommand(BaseTransformersCLICommand):
         # 2. c. [no processing needed] lists are lists of ints because `generate` doesn't take lists of strings :)
         # We also mention in the help message that we only accept lists of ints for now.
 
-        # 3. Join the the result into a comma separated string
+        # 3. Join the result into a comma separated string
         generate_flags_string = ", ".join([f"{k}: {v}" for k, v in generate_flags_as_dict.items()])
 
         # 4. Add the opening/closing brackets
@@ -446,11 +477,13 @@ class ChatCommand(BaseTransformersCLICommand):
             )
         return processed_generate_flags
 
-    def get_generation_parameterization(self, args: ChatArguments) -> tuple[GenerationConfig, dict]:
+    def get_generation_parameterization(
+        self, args: ChatArguments, model_generation_config: GenerationConfig
+    ) -> tuple[GenerationConfig, dict]:
         """
         Returns a GenerationConfig object holding the generation parameters for the CLI command.
         """
-        # No generation config arg provided -> use base generation config, apply CLI defaults
+        # No generation config arg provided -> use model's default generation config, then apply CLI defaults
         if args.generation_config is not None:
             if ".json" in args.generation_config:  # is a local file
                 dirname = os.path.dirname(args.generation_config)
@@ -462,7 +495,8 @@ class ChatCommand(BaseTransformersCLICommand):
             # !!!!!!!!!
             # This is a chat session, so we have a few non-standard defaults
             # !!!!!!!!!
-            generation_config = GenerationConfig(do_sample=True, max_new_tokens=256)
+            generation_config = copy.deepcopy(model_generation_config)
+            generation_config.update(**{"do_sample": True, "max_new_tokens": 256})
 
         # Finally: parse and apply `generate_flags`
         parsed_generate_flags = self.parse_generate_flags(args.generate_flags)
@@ -504,11 +538,11 @@ class ChatCommand(BaseTransformersCLICommand):
         if model_args.load_in_4bit:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                # For consistency with model weights, we use the same value as `torch_dtype`
-                bnb_4bit_compute_dtype=model_args.torch_dtype,
+                # For consistency with model weights, we use the same value as `dtype`
+                bnb_4bit_compute_dtype=model_args.dtype,
                 bnb_4bit_quant_type=model_args.bnb_4bit_quant_type,
                 bnb_4bit_use_double_quant=model_args.use_bnb_nested_quant,
-                bnb_4bit_quant_storage=model_args.torch_dtype,
+                bnb_4bit_quant_storage=model_args.dtype,
             )
         elif model_args.load_in_8bit:
             quantization_config = BitsAndBytesConfig(
@@ -526,12 +560,12 @@ class ChatCommand(BaseTransformersCLICommand):
             trust_remote_code=args.trust_remote_code,
         )
 
-        torch_dtype = args.torch_dtype if args.torch_dtype in ["auto", None] else getattr(torch, args.torch_dtype)
+        dtype = args.dtype if args.dtype in ["auto", None] else getattr(torch, args.dtype)
         quantization_config = self.get_quantization_config(args)
         model_kwargs = {
             "revision": args.model_revision,
             "attn_implementation": args.attn_implementation,
-            "torch_dtype": torch_dtype,
+            "dtype": dtype,
             "device_map": "auto",
             "quantization_config": quantization_config,
         }
@@ -637,7 +671,7 @@ class ChatCommand(BaseTransformersCLICommand):
         if self.spawn_backend:
             serve_args = ServeArguments(
                 device=self.args.device,
-                torch_dtype=self.args.torch_dtype,
+                dtype=self.args.dtype,
                 trust_remote_code=self.args.trust_remote_code,
                 attn_implementation=self.args.attn_implementation,
                 load_in_8bit=self.args.load_in_8bit,
@@ -670,13 +704,12 @@ class ChatCommand(BaseTransformersCLICommand):
         else:
             user = args.user
 
-        generation_config, model_kwargs = self.get_generation_parameterization(args)
+        model_generation_config = GenerationConfig.from_pretrained(args.model_name_or_path)
+        generation_config, model_kwargs = self.get_generation_parameterization(args, model_generation_config)
 
         interface = RichInterface(model_name=args.model_name_or_path, user_name=user)
         interface.clear()
         chat = self.clear_chat_history(args.system_prompt)
-
-        request_id = None
 
         # Starts the session with a minimal help message at the top, so that a user doesn't get stuck
         interface.print_help(minimal=True)
@@ -709,13 +742,12 @@ class ChatCommand(BaseTransformersCLICommand):
                     chat,
                     stream=True,
                     extra_body={
-                        "request_id": request_id,
-                        "generation_config": {**generation_config.to_dict()},
+                        "generation_config": generation_config.to_json_string(),
                         "model": model,
                     },
                 )
 
-                model_output, request_id = await interface.stream_output(stream)
+                model_output = await interface.stream_output(stream)
 
                 chat.append({"role": "assistant", "content": model_output})
 

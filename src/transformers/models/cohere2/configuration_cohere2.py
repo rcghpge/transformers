@@ -216,14 +216,17 @@ class Cohere2Config(PretrainedConfig):
             **kwargs,
         )
 
+        # BC -> the pattern used to be a simple int, and it's still present in configs on the Hub
+        self._sliding_window_pattern = kwargs.get("sliding_window_pattern", 4)
+
         if self.layer_types is None:
             # BC -> the pattern used to be a simple int, and it's still present in configs on the Hub
-            sliding_window_pattern = getattr(self, "sliding_window_pattern", 4)
+            self._sliding_window_pattern = getattr(self, "sliding_window_pattern", 4)
             self.layer_types = [
-                "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
+                "sliding_attention" if bool((i + 1) % self._sliding_window_pattern) else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types)
+        layer_type_validation(self.layer_types, self.num_hidden_layers)
 
 
 __all__ = ["Cohere2Config"]

@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ...cache_utils import Cache
 from ...generation import GenerationMixin
 from ...modeling_outputs import ModelOutput
 from ...modeling_utils import PreTrainedModel
@@ -44,17 +45,16 @@ class GraniteSpeechCausalLMOutputWithPast(ModelOutput):
         Language modeling loss (for next-token prediction).
     logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-        Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
-        `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
         Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
         `past_key_values` input) to speed up sequential decoding.
     """
 
     loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
-    past_key_values: Optional[list[torch.FloatTensor]] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
 
@@ -157,8 +157,7 @@ class GraniteSpeechConformerAttention(nn.Module):
         value_states = value_states.reshape(bsz, num_blocks, self.context_size, self.num_heads, -1).transpose(2, 3)
 
         # shaw's relative positional embedding
-        dist = attention_dists.to(hidden_states.device)
-        rel_pos_emb = self.rel_pos_emb(dist)
+        rel_pos_emb = self.rel_pos_emb(attention_dists)
         # alternative computation of `pos_attn` - for readability
         # rel_pos_emb_expanded = rel_pos_emb.view([1, 1, 1] + list(rel_pos_emb.shape))
         # pos_attn = torch.sum(query_states.unsqueeze(-2) * rel_pos_emb_expanded, dim=-1) * self.scale
@@ -258,8 +257,8 @@ class GraniteSpeechCTCEncoder(nn.Module):
         # Precompute clamped relative positional encoding distances
         seq = torch.arange(config.context_size)
         relpos_dist = seq.view(-1, 1) - seq.view(1, -1)
-        self.attention_dists = torch.clamp(relpos_dist, -config.context_size, config.context_size) + config.max_pos_emb
-
+        attention_dists = torch.clamp(relpos_dist, -config.context_size, config.context_size) + config.max_pos_emb
+        self.register_buffer("attention_dists", attention_dists, persistent=False)
         self.input_linear = nn.Linear(config.input_dim, config.hidden_dim, bias=True)
         self.layers = nn.ModuleList([GraniteSpeechConformerBlock(config) for _ in range(config.num_layers)])
 
@@ -281,9 +280,9 @@ class GraniteSpeechCTCEncoder(nn.Module):
 
 @auto_docstring
 class GraniteSpeechPreTrainedModel(PreTrainedModel):
-    config_class = GraniteSpeechConfig
-    _supports_cache_class = True
-    _supports_flash_attn_2 = True
+    config: GraniteSpeechConfig
+
+    _supports_flash_attn = False  # `blip_2_qformer` dependency does not allow for this
     _supports_sdpa = True
 
     def _init_weights(self, module: nn.Module):
@@ -356,12 +355,12 @@ class GraniteSpeechForConditionalGeneration(GraniteSpeechPreTrainedModel, Genera
     @auto_docstring
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        input_features: torch.FloatTensor = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        input_features: Optional[torch.FloatTensor] = None,
         input_features_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -373,10 +372,6 @@ class GraniteSpeechForConditionalGeneration(GraniteSpeechPreTrainedModel, Genera
         **lm_kwargs,
     ) -> Union[tuple[torch.Tensor], GraniteSpeechCausalLMOutputWithPast]:
         r"""
-        input_features (`torch.FloatTensor` of shape `(batch_size, audio seq len, mel feat dim)):
-            The tensors corresponding to the input audios. input features can be obtained using
-            [`AutoFeatureExtractor`]. See [`GraniteSpeechFeatureExtractor.__call__`] for details.
-            [`GraniteSpeechProcessor`] uses [`GraniteSpeechFeatureExtractor`] for processing audio.
         input_features_mask (`torch.Tensor`, *optional*):
             Mask to be applied to audio features prior to scattering into the language embeddings.
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):

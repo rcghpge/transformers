@@ -18,7 +18,6 @@ import math
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
@@ -53,8 +52,6 @@ class NystromformerEmbeddings(nn.Module):
         self.position_embeddings = nn.Embedding(config.max_position_embeddings + 2, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -167,17 +164,23 @@ class NystromformerSelfAttention(nn.Module):
             )
         return value
 
-    def transpose_for_scores(self, layer):
-        new_layer_shape = layer.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        layer = layer.view(*new_layer_shape)
-        return layer.permute(0, 2, 1, 3)
-
     def forward(self, hidden_states, attention_mask=None, output_attentions=False):
-        mixed_query_layer = self.query(hidden_states)
-
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        batch_size, seq_length, _ = hidden_states.shape
+        query_layer = (
+            self.query(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_layer = (
+            self.key(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         query_layer = query_layer / math.sqrt(math.sqrt(self.attention_head_size))
         key_layer = key_layer / math.sqrt(math.sqrt(self.attention_head_size))
@@ -437,15 +440,13 @@ class NystromformerOnlyMLMHead(nn.Module):
 
 @auto_docstring
 class NystromformerPreTrainedModel(PreTrainedModel):
-    config_class = NystromformerConfig
+    config: NystromformerConfig
     base_model_prefix = "nystromformer"
     supports_gradient_checkpointing = True
 
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()

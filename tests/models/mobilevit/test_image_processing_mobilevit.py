@@ -15,21 +15,20 @@
 
 import unittest
 
-import requests
 from datasets import load_dataset
 
+from transformers.image_utils import load_image
 from transformers.testing_utils import require_torch, require_vision
 from transformers.utils import is_torch_available, is_torchvision_available, is_vision_available
 
 from ...test_image_processing_common import ImageProcessingTestMixin, prepare_image_inputs
+from ...test_processing_common import url_to_local_path
 
 
 if is_torch_available():
     import torch
 
 if is_vision_available():
-    from PIL import Image
-
     from transformers import MobileViTImageProcessor
 
     if is_torchvision_available():
@@ -50,6 +49,7 @@ class MobileViTImageProcessingTester:
         do_center_crop=True,
         crop_size=None,
         do_flip_channel_order=True,
+        do_reduce_labels=False,
     ):
         size = size if size is not None else {"shortest_edge": 20}
         crop_size = crop_size if crop_size is not None else {"height": 18, "width": 18}
@@ -64,6 +64,7 @@ class MobileViTImageProcessingTester:
         self.do_center_crop = do_center_crop
         self.crop_size = crop_size
         self.do_flip_channel_order = do_flip_channel_order
+        self.do_reduce_labels = do_reduce_labels
 
     def prepare_image_processor_dict(self):
         return {
@@ -72,6 +73,7 @@ class MobileViTImageProcessingTester:
             "do_center_crop": self.do_center_crop,
             "crop_size": self.crop_size,
             "do_flip_channel_order": self.do_flip_channel_order,
+            "do_reduce_labels": self.do_reduce_labels,
         }
 
     def expected_output_image_shape(self, images):
@@ -122,16 +124,21 @@ class MobileViTImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             self.assertTrue(hasattr(image_processing, "do_center_crop"))
             self.assertTrue(hasattr(image_processing, "center_crop"))
             self.assertTrue(hasattr(image_processing, "do_flip_channel_order"))
+            self.assertTrue(hasattr(image_processing, "do_reduce_labels"))
 
     def test_image_processor_from_dict_with_kwargs(self):
         for image_processing_class in self.image_processor_list:
             image_processor = self.image_processing_class.from_dict(self.image_processor_dict)
             self.assertEqual(image_processor.size, {"shortest_edge": 20})
             self.assertEqual(image_processor.crop_size, {"height": 18, "width": 18})
+            self.assertEqual(image_processor.do_reduce_labels, False)
 
-            image_processor = self.image_processing_class.from_dict(self.image_processor_dict, size=42, crop_size=84)
+            image_processor = self.image_processing_class.from_dict(
+                self.image_processor_dict, size=42, crop_size=84, do_reduce_labels=True
+            )
             self.assertEqual(image_processor.size, {"shortest_edge": 42})
             self.assertEqual(image_processor.crop_size, {"height": 84, "width": 84})
+            self.assertEqual(image_processor.do_reduce_labels, True)
 
     def test_call_segmentation_maps(self):
         for image_processing_class in self.image_processor_list:
@@ -240,6 +247,22 @@ class MobileViTImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             self.assertTrue(encoding["labels"].min().item() >= 0)
             self.assertTrue(encoding["labels"].max().item() <= 255)
 
+    def test_reduce_labels(self):
+        for image_processing_class in self.image_processor_list:
+            # Initialize image_processing
+            image_processing = self.image_processing_class(**self.image_processor_dict)
+
+            # ADE20k has 150 classes, and the background is included, so labels should be between 0 and 150
+            image, map = prepare_semantic_single_inputs()
+            encoding = image_processing(image, map, return_tensors="pt")
+            self.assertTrue(encoding["labels"].min().item() >= 0)
+            self.assertTrue(encoding["labels"].max().item() <= 150)
+
+            image_processing.do_reduce_labels = True
+            encoding = image_processing(image, map, return_tensors="pt")
+            self.assertTrue(encoding["labels"].min().item() >= 0)
+            self.assertTrue(encoding["labels"].max().item() <= 255)
+
     @require_vision
     @require_torch
     def test_slow_fast_equivalence(self):
@@ -250,9 +273,7 @@ class MobileViTImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
             self.skipTest(reason="Skipping slow/fast equivalence test as one of the image processors is not defined")
 
         # Test with single image
-        dummy_image = Image.open(
-            requests.get("http://images.cocodataset.org/val2017/000000039769.jpg", stream=True).raw
-        )
+        dummy_image = load_image(url_to_local_path("http://images.cocodataset.org/val2017/000000039769.jpg"))
         image_processor_slow = self.image_processing_class(**self.image_processor_dict)
         image_processor_fast = self.fast_image_processing_class(**self.image_processor_dict)
 

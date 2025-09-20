@@ -108,8 +108,6 @@ class DPRPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -246,8 +244,7 @@ class DPRPretrainedContextEncoder(DPRPreTrainedModel):
     models.
     """
 
-    config_class = DPRConfig
-    load_tf_weights = None
+    config: DPRConfig
     base_model_prefix = "ctx_encoder"
 
 
@@ -257,8 +254,7 @@ class DPRPretrainedQuestionEncoder(DPRPreTrainedModel):
     models.
     """
 
-    config_class = DPRConfig
-    load_tf_weights = None
+    config: DPRConfig
     base_model_prefix = "question_encoder"
 
 
@@ -268,8 +264,7 @@ class DPRPretrainedReader(DPRPreTrainedModel):
     models.
     """
 
-    config_class = DPRConfig
-    load_tf_weights = None
+    config: DPRConfig
     base_model_prefix = "span_predictor"
 
 

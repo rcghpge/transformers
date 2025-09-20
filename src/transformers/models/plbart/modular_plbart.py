@@ -18,7 +18,6 @@ import math
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
@@ -58,24 +57,13 @@ class PLBartScaledWordEmbedding(BartScaledWordEmbedding):
 
 @auto_docstring
 class PLBartPreTrainedModel(PreTrainedModel):
-    config_class = PLBartConfig
+    config: PLBartConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["PLBartDecoderLayer", "PLBartEncoderLayer"]
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
-
-    def _init_weights(self, module):
-        std = self.config.init_std
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
 
     # Copied from transformers.models.bart.modeling_bart.BartPreTrainedModel._update_full_mask
     def _update_full_mask(
@@ -84,7 +72,7 @@ class PLBartPreTrainedModel(PreTrainedModel):
         inputs_embeds: torch.Tensor,
     ):
         if attention_mask is not None:
-            if self.config._attn_implementation == "flash_attention_2":
+            if "flash" in self.config._attn_implementation:
                 attention_mask = attention_mask if 0 in attention_mask else None
             elif self.config._attn_implementation == "sdpa":
                 # output_attentions=True & head_mask can not be supported when using SDPA, fall back to
@@ -122,7 +110,7 @@ class PLBartPreTrainedModel(PreTrainedModel):
                 )
             return attention_mask
 
-        if self.config._attn_implementation == "flash_attention_2":
+        if "flash" in self.config._attn_implementation:
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask
             return None
@@ -243,7 +231,7 @@ class PLBartPreTrainedModel(PreTrainedModel):
     ):
         # expand encoder attention mask
         if encoder_hidden_states is not None and encoder_attention_mask is not None:
-            if self.config._attn_implementation == "flash_attention_2":
+            if "flash" in self.config._attn_implementation:
                 encoder_attention_mask = encoder_attention_mask if 0 in encoder_attention_mask else None
             elif self.config._attn_implementation == "sdpa":
                 # output_attentions=True & cross_attn_head_mask can not be supported when using SDPA, and we fall back on
@@ -310,9 +298,6 @@ class PLBartModel(PLBartPreTrainedModel):
     def get_encoder(self):
         return self.encoder
 
-    def get_decoder(self):
-        return self.decoder
-
     @auto_docstring
     def forward(
         self,
@@ -324,7 +309,7 @@ class PLBartModel(PLBartPreTrainedModel):
         decoder_head_mask: Optional[torch.LongTensor] = None,
         cross_attn_head_mask: Optional[torch.Tensor] = None,
         encoder_outputs: Optional[list[torch.FloatTensor]] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -392,7 +377,7 @@ class PLBartModel(PLBartPreTrainedModel):
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
 
-        # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
+        # decoder outputs consists of (dec_features, past_key_values, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -464,12 +449,6 @@ class PLBartForConditionalGeneration(PLBartPreTrainedModel, GenerationMixin):
             new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
         self.register_buffer("final_logits_bias", new_bias)
 
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
     @auto_docstring
     def forward(
         self,
@@ -481,7 +460,7 @@ class PLBartForConditionalGeneration(PLBartPreTrainedModel, GenerationMixin):
         decoder_head_mask: Optional[torch.LongTensor] = None,
         cross_attn_head_mask: Optional[torch.Tensor] = None,
         encoder_outputs: Optional[list[torch.FloatTensor]] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.Tensor] = None,
@@ -595,17 +574,6 @@ class PLBartForConditionalGeneration(PLBartPreTrainedModel, GenerationMixin):
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
         return shift_tokens_right(labels, self.config.pad_token_id)
-
-    @staticmethod
-    def _reorder_cache(past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            # cached cross_attention states don't have to be reordered -> they are always the same
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past[:2])
-                + layer_past[2:],
-            )
-        return reordered_past
 
 
 class PLBartClassificationHead(BartClassificationHead):

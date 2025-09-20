@@ -21,9 +21,8 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import Tensor, nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
 from ...modeling_layers import GradientCheckpointingLayer
@@ -64,11 +63,6 @@ def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = Fals
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
-    Comment by Ross Wightman: This is the same as the DropConnect impl I created for EfficientNet, etc networks,
-    however, the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for changing the
-    layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use 'survival rate' as the
-    argument.
     """
     if drop_prob == 0.0 or not training:
         return input
@@ -260,11 +254,6 @@ class BeitSelfAttention(nn.Module):
         if self.has_relative_position_bias:
             self.relative_position_bias = BeitRelativePositionBias(config, window_size=window_size)
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -274,11 +263,22 @@ class BeitSelfAttention(nn.Module):
         interpolate_pos_encoding: bool = False,
         resolution: Optional[tuple[int]] = None,
     ) -> Union[tuple[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
-        mixed_query_layer = self.query(hidden_states)
-
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        batch_size, seq_length, _ = hidden_states.shape
+        query_layer = (
+            self.query(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_layer = (
+            self.key(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -345,10 +345,22 @@ class BeitSdpaSelfAttention(BeitSelfAttention):
                 resolution=resolution,
             )
 
-        mixed_query_layer = self.query(hidden_states)
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        batch_size, seq_length, _ = hidden_states.shape
+        query_layer = (
+            self.query(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_layer = (
+            self.key(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         attn_bias = None
         if self.has_relative_position_bias:
@@ -704,7 +716,7 @@ class BeitEncoder(nn.Module):
 
 @auto_docstring
 class BeitPreTrainedModel(PreTrainedModel):
-    config_class = BeitConfig
+    config: BeitConfig
     base_model_prefix = "beit"
     main_input_name = "pixel_values"
     supports_gradient_checkpointing = True
@@ -715,8 +727,6 @@ class BeitPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -870,6 +880,9 @@ class BeitForMaskedImageModeling(BeitPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def get_output_embeddings(self):
+        return None
+
     @auto_docstring
     def forward(
         self,
@@ -999,26 +1012,8 @@ class BeitForImageClassification(BeitPreTrainedModel):
 
         loss = None
         if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
+            loss = self.loss_function(labels, logits, self.config)
 
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
         if not return_dict:
             output = (logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output

@@ -135,6 +135,8 @@ class Gemma3TextConfig(PretrainedConfig):
                     Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
         rope_local_base_freq (float, *optional*, defaults to 10000.0):
             The base period of the RoPE embeddings for local attention.
+        use_bidirectional_attention (`bool`, *optional*, defaults to `False`): If True, the model will attend to all
+            text tokens instead of using a causal mask. This does not change behavior for vision tokens.
 
     ```python
     >>> from transformers import Gemma3TextModel, Gemma3TextConfig
@@ -145,10 +147,6 @@ class Gemma3TextConfig(PretrainedConfig):
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```
-        rope_local_base_freq (float, *optional*, defaults to 10000.0):
-            The base period of the RoPE embeddings for local attention.
-        sliding_window_pattern (`int`, *optional*, defaults to 6):
-            Pattern for the sliding window attention.
     """
 
     model_type = "gemma3_text"
@@ -196,6 +194,7 @@ class Gemma3TextConfig(PretrainedConfig):
         attn_logit_softcapping=None,
         rope_scaling=None,
         rope_local_base_freq=10_000.0,
+        use_bidirectional_attention=False,
         **kwargs,
     ):
         super().__init__(
@@ -225,19 +224,23 @@ class Gemma3TextConfig(PretrainedConfig):
         self.final_logit_softcapping = final_logit_softcapping
         self.attn_logit_softcapping = attn_logit_softcapping
         self.layer_types = layer_types
+        self.use_bidirectional_attention = use_bidirectional_attention
+        if use_bidirectional_attention:
+            self.sliding_window = (self.sliding_window // 2) + 1  # due to fa we set exclusive bounds
 
         self.rope_local_base_freq = rope_local_base_freq
         self.rope_scaling = rope_scaling
         rope_config_validation(self)
 
+        # BC -> the pattern used to be a simple int, and it's still present in configs on the Hub
+        self._sliding_window_pattern = kwargs.get("sliding_window_pattern", 6)
+
         if self.layer_types is None:
-            # BC -> the pattern used to be a simple int, and it's still present in configs on the Hub
-            sliding_window_pattern = getattr(self, "sliding_window_pattern", 6)
             self.layer_types = [
-                "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
+                "sliding_attention" if bool((i + 1) % self._sliding_window_pattern) else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types)
+        layer_type_validation(self.layer_types, self.num_hidden_layers)
 
 
 class Gemma3Config(PretrainedConfig):

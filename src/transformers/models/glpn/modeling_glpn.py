@@ -18,7 +18,6 @@ import math
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 
 from ...activations import ACT2FN
@@ -37,11 +36,6 @@ def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = Fals
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
-    Comment by Ross Wightman: This is the same as the DropConnect impl I created for EfficientNet, etc networks,
-    however, the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for changing the
-    layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use 'survival rate' as the
-    argument.
     """
     if drop_prob == 0.0 or not training:
         return input
@@ -126,11 +120,6 @@ class GLPNEfficientSelfAttention(nn.Module):
             )
             self.layer_norm = nn.LayerNorm(hidden_size)
 
-    def transpose_for_scores(self, hidden_states):
-        new_shape = hidden_states.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        hidden_states = hidden_states.view(new_shape)
-        return hidden_states.permute(0, 2, 1, 3)
-
     def forward(
         self,
         hidden_states,
@@ -138,7 +127,12 @@ class GLPNEfficientSelfAttention(nn.Module):
         width,
         output_attentions=False,
     ):
-        query_layer = self.transpose_for_scores(self.query(hidden_states))
+        batch_size, seq_length, _ = hidden_states.shape
+        query_layer = (
+            self.query(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         if self.sr_ratio > 1:
             batch_size, seq_len, num_channels = hidden_states.shape
@@ -150,8 +144,16 @@ class GLPNEfficientSelfAttention(nn.Module):
             hidden_states = hidden_states.reshape(batch_size, num_channels, -1).permute(0, 2, 1)
             hidden_states = self.layer_norm(hidden_states)
 
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        key_layer = (
+            self.key(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -401,7 +403,7 @@ class GLPNEncoder(nn.Module):
 
 @auto_docstring
 class GLPNPreTrainedModel(PreTrainedModel):
-    config_class = GLPNConfig
+    config: GLPNConfig
     base_model_prefix = "glpn"
     main_input_name = "pixel_values"
     _no_split_modules = []
@@ -410,8 +412,6 @@ class GLPNPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()

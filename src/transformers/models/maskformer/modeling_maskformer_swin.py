@@ -107,11 +107,6 @@ def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = Fals
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
-    Comment by Ross Wightman: This is the same as the DropConnect impl I created for EfficientNet, etc networks,
-    however, the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for changing the
-    layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use 'survival rate' as the
-    argument.
     """
     if drop_prob == 0.0 or not training:
         return input
@@ -280,7 +275,7 @@ class MaskFormerSwinPatchMerging(nn.Module):
         batch_size, dim, num_channels = input_feature.shape
 
         input_feature = input_feature.view(batch_size, height, width, num_channels)
-        # pad input to be disible by width and height, if needed
+        # pad input to be divisible by width and height, if needed
         input_feature = self.maybe_pad(input_feature, height, width)
         # [batch_size, height/2, width/2, num_channels]
         input_feature_0 = input_feature[:, 0::2, 0::2, :]
@@ -354,11 +349,6 @@ class MaskFormerSwinSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -367,11 +357,11 @@ class MaskFormerSwinSelfAttention(nn.Module):
         output_attentions: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
         batch_size, dim, num_channels = hidden_states.shape
-        mixed_query_layer = self.query(hidden_states)
+        hidden_shape = (batch_size, dim, -1, self.attention_head_size)
 
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        query_layer = self.query(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_layer = self.key(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_layer = self.value(hidden_states).view(hidden_shape).transpose(1, 2)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -542,9 +532,9 @@ class MaskFormerSwinLayer(nn.Module):
 
     def maybe_pad(self, hidden_states, height, width):
         pad_left = pad_top = 0
-        pad_rigth = (self.window_size - width % self.window_size) % self.window_size
+        pad_right = (self.window_size - width % self.window_size) % self.window_size
         pad_bottom = (self.window_size - height % self.window_size) % self.window_size
-        pad_values = (0, 0, pad_left, pad_rigth, pad_top, pad_bottom)
+        pad_values = (0, 0, pad_left, pad_right, pad_top, pad_bottom)
         hidden_states = nn.functional.pad(hidden_states, pad_values)
         return hidden_states, pad_values
 
@@ -739,7 +729,7 @@ class MaskFormerSwinEncoder(nn.Module):
 
 @auto_docstring
 class MaskFormerSwinPreTrainedModel(PreTrainedModel):
-    config_class = MaskFormerSwinConfig
+    config: MaskFormerSwinConfig
     base_model_prefix = "model"
     main_input_name = "pixel_values"
     supports_gradient_checkpointing = True
@@ -748,8 +738,6 @@ class MaskFormerSwinPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()

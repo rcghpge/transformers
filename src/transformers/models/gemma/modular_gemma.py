@@ -17,23 +17,24 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import sentencepiece as spm
 import torch
-import torch.utils.checkpoint
 from torch import nn
 
 from ...cache_utils import Cache, DynamicCache
 from ...configuration_utils import PretrainedConfig
 from ...masking_utils import create_causal_mask
-from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import BaseModelOutputWithPast
+from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...tokenization_utils import AddedToken, PreTrainedTokenizer
-from ...utils import logging
+from ...utils import TransformersKwargs, logging
 from ..llama.modeling_llama import (
     LlamaForCausalLM,
     LlamaForSequenceClassification,
     LlamaForTokenClassification,
     LlamaMLP,
     LlamaModel,
+    LlamaPreTrainedModel,
+    LlamaRotaryEmbedding,
 )
 from ..llama.tokenization_llama import LlamaTokenizer
 
@@ -81,9 +82,6 @@ class GemmaConfig(PretrainedConfig):
             The attention head dimension.
         hidden_act (`str` or `function`, *optional*, defaults to `"gelu_pytorch_tanh"`):
             The legacy activation function. It is overwritten by the `hidden_activation`.
-        hidden_activation (`str` or `function`, *optional*):
-            The non-linear activation function (function or string) in the decoder. Will default to `"gelu_pytorch_tanh"`
-            if not specified. `"gelu_pytorch_tanh"` uses an approximation of the `"gelu"` activation function.
         max_position_embeddings (`int`, *optional*, defaults to 8192):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -144,7 +142,6 @@ class GemmaConfig(PretrainedConfig):
         num_key_value_heads=16,
         head_dim=256,
         hidden_act="gelu_pytorch_tanh",
-        hidden_activation=None,
         max_position_embeddings=8192,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
@@ -167,7 +164,6 @@ class GemmaConfig(PretrainedConfig):
         self.head_dim = head_dim
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
-        self.hidden_activation = hidden_activation
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -362,10 +358,23 @@ class GemmaRMSNorm(nn.Module):
 
 class GemmaMLP(LlamaMLP):
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+
+class GemmaRotaryEmbedding(LlamaRotaryEmbedding):
+    pass
+
+
+class GemmaPreTrainedModel(LlamaPreTrainedModel):
+    def _init_weights(self, module):
+        PreTrainedModel._init_weights(self, module)
+
+        # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
+        if "RMSNorm" in module.__class__.__name__:
+            module.weight.data.zero_()
 
 
 class GemmaModel(LlamaModel):
@@ -377,31 +386,17 @@ class GemmaModel(LlamaModel):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
-            use_cache = False
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+            past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -418,6 +413,7 @@ class GemmaModel(LlamaModel):
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
+            position_ids=position_ids,
         )
 
         # embed positions
@@ -432,42 +428,21 @@ class GemmaModel(LlamaModel):
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
 
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            layer_outputs = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
-                output_attentions=output_attentions,
+                past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-
-            hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
         hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
         )
 
 

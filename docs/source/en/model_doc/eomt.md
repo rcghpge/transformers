@@ -8,6 +8,7 @@ specific language governing permissions and limitations under the License.
 ⚠️ Note that this file is in Markdown but contain specific syntax for our doc-builder (similar to MDX) that may not be
 rendered properly in your Markdown viewer.
 -->
+*This model was released on 2025-03-24 and added to Hugging Face Transformers on 2025-06-27.*
 
 # EoMT
 
@@ -17,7 +18,7 @@ rendered properly in your Markdown viewer.
 
 ## Overview
 
-The Encoder-only Mask Transformer (EoMT) model was introduced in the CVPR 2025 Highlight Paper [Your ViT is Secretly an Image Segmentation Model](https://www.tue-mps.org/eomt) by Tommie Kerssies, Niccolò Cavagnero, Alexander Hermans, Narges Norouzi, Giuseppe Averta, Bastian Leibe, Gijs Dubbelman, and Daan de Geus.
+[The Encoder-only Mask Transformer]((https://www.tue-mps.org/eomt)) (EoMT) model was introduced in the CVPR 2025 Highlight Paper *[Your ViT is Secretly an Image Segmentation Model](https://huggingface.co/papers/2503.19108)* by Tommie Kerssies, Niccolò Cavagnero, Alexander Hermans, Narges Norouzi, Giuseppe Averta, Bastian Leibe, Gijs Dubbelman, and Daan de Geus.
 EoMT reveals Vision Transformers can perform image segmentation efficiently without task-specific components.
 
 The abstract from the paper is the following:
@@ -74,20 +75,16 @@ inputs = processor(
     return_tensors="pt",
 )
 
-# Remove Patch Offsets from inputs — only used later for post-processing.
-patch_offsets = inputs.pop("patch_offsets")
-
 with torch.inference_mode():
     outputs = model(**inputs)
 
 # Prepare the original image size in the format (height, width)
-original_image_sizes = [(image.height, image.width)]
+target_sizes = [(image.height, image.width)]
 
 # Post-process the model outputs to get final segmentation prediction
 preds = processor.post_process_semantic_segmentation(
     outputs,
-    patch_offsets=patch_offsets,
-    original_image_sizes=original_image_sizes,
+    target_sizes=target_sizes,
 )
 
 # Visualize the segmentation mask
@@ -130,12 +127,12 @@ with torch.inference_mode():
     outputs = model(**inputs)
 
 # Prepare the original image size in the format (height, width)
-original_image_sizes = [(image.height, image.width)]
+target_sizes = [(image.height, image.width)]
 
 # Post-process the model outputs to get final segmentation prediction
 preds = processor.post_process_instance_segmentation(
     outputs,
-    original_image_sizes=original_image_sizes,
+    target_sizes=target_sizes,
 )
 
 # Visualize the segmentation mask
@@ -173,12 +170,12 @@ with torch.inference_mode():
     outputs = model(**inputs)
 
 # Prepare the original image size in the format (height, width)
-original_image_sizes = [(image.height, image.width)]
+target_sizes = [(image.height, image.width)]
 
 # Post-process the model outputs to get final segmentation prediction
 preds = processor.post_process_panoptic_segmentation(
     outputs,
-    original_image_sizes=original_image_sizes,
+    target_sizes=target_sizes,
 )
 
 # Visualize the panoptic segmentation mask

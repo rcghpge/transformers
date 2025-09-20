@@ -19,7 +19,6 @@ import warnings
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
 from torch.nn import functional as F
@@ -328,12 +327,7 @@ class BloomAttention(nn.Module):
             output_tensor = self.dense(context_layer)
 
         output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
-
-        outputs = (output_tensor, layer_past)
-        if output_attentions:
-            outputs += (attention_probs,)
-
-        return outputs
+        return output_tensor, attention_probs
 
 
 class BloomMLP(nn.Module):
@@ -405,7 +399,7 @@ class BloomBlock(GradientCheckpointingLayer):
             residual = hidden_states
 
         # Self attention.
-        attn_outputs = self.self_attention(
+        attention_output, attn_weights = self.self_attention(
             layernorm_output,
             residual,
             layer_past=layer_past,
@@ -416,10 +410,6 @@ class BloomBlock(GradientCheckpointingLayer):
             output_attentions=output_attentions,
             cache_position=cache_position,
         )
-
-        attention_output = attn_outputs[0]
-
-        outputs = attn_outputs[1:]
 
         layernorm_output = self.post_attention_layernorm(attention_output)
 
@@ -432,24 +422,18 @@ class BloomBlock(GradientCheckpointingLayer):
         # MLP.
         output = self.mlp(layernorm_output, residual)
 
-        if use_cache:
-            outputs = (output,) + outputs
-        else:
-            outputs = (output,) + outputs[1:]
-
-        return outputs  # hidden_states, past_kv, attentions
+        return output, attn_weights  # hidden_states, attentions
 
 
 @auto_docstring
 class BloomPreTrainedModel(PreTrainedModel):
-    config_class = BloomConfig
+    config: BloomConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
     _no_split_modules = ["BloomBlock"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_cache_class = True
-    _supports_static_cache = True
-    _supports_quantized_cache = True
+
+    _can_compile_fullgraph = True
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
@@ -457,8 +441,6 @@ class BloomPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module: nn.Module):
         """Initialize the weights."""
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -520,7 +502,7 @@ class BloomModel(BloomPreTrainedModel):
     ) -> Union[tuple[torch.Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values[0][0].shape[2]`
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values.get_seq_length()`
             (`sequence_length` of input past key value states). Indices of input sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -560,19 +542,8 @@ class BloomModel(BloomPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 
-        # kept for BC (non `Cache` `past_key_values` inputs)
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
-            return_legacy_cache = True
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                logger.warning_once(
-                    "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-                    "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-                    "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
-                )
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
 
         batch_size, seq_length, _ = inputs_embeds.shape
         past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -587,7 +558,6 @@ class BloomModel(BloomPreTrainedModel):
         head_mask = self.get_head_mask(head_mask, self.config.n_layer)
         hidden_states = self.word_embeddings_layernorm(inputs_embeds)
 
-        next_decoder_cache = None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
@@ -618,11 +588,8 @@ class BloomModel(BloomPreTrainedModel):
             )
 
             hidden_states = outputs[0]
-            if use_cache:
-                next_decoder_cache = outputs[1]
-
             if output_attentions:
-                all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+                all_self_attentions = all_self_attentions + (outputs[1],)
 
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)
@@ -630,18 +597,14 @@ class BloomModel(BloomPreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-        if return_legacy_cache:
-            next_cache = next_cache.to_legacy_cache()
-
         if not return_dict:
             return tuple(
-                v for v in [hidden_states, next_cache, all_hidden_states, all_self_attentions] if v is not None
+                v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attentions] if v is not None
             )
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
@@ -789,9 +752,6 @@ class BloomForCausalLM(BloomPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_output_embeddings(self):
-        return self.lm_head
-
     def set_output_embeddings(self, new_embeddings: torch.Tensor):
         self.lm_head = new_embeddings
 
@@ -855,6 +815,12 @@ class BloomForCausalLM(BloomPreTrainedModel, GenerationMixin):
                 "attention_mask": attention_mask,
             }
         )
+
+        # Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
+        for key, value in kwargs.items():
+            if key not in model_inputs:
+                model_inputs[key] = value
+
         return model_inputs
 
     @auto_docstring
@@ -875,7 +841,7 @@ class BloomForCausalLM(BloomPreTrainedModel, GenerationMixin):
     ) -> Union[tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values[0][0].shape[2]`
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values.get_seq_length()`
             (`sequence_length` of input past key value states). Indices of input sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -944,29 +910,6 @@ class BloomForCausalLM(BloomPreTrainedModel, GenerationMixin):
             attentions=transformer_outputs.attentions,
         )
 
-    def _reorder_cache(
-        self, past: tuple[tuple[torch.Tensor, torch.Tensor], ...], beam_idx: torch.LongTensor
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
-        """
-        This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
-        [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
-        beam_idx at every generation step.
-
-        Output shares the same memory storage as `past`.
-        """
-        # Get a copy of `beam_idx` on all the devices where we need those indices.
-        device_to_beam_idx = {
-            past_state.device: beam_idx.to(past_state.device) for layer_past in past for past_state in layer_past
-        }
-        reordered_past = tuple(
-            (
-                layer_past[0].index_select(0, device_to_beam_idx[layer_past[0].device]),
-                layer_past[1].index_select(0, device_to_beam_idx[layer_past[0].device]),
-            )
-            for layer_past in past
-        )
-        return reordered_past
-
 
 @auto_docstring(
     custom_intro="""
@@ -1009,7 +952,7 @@ class BloomForSequenceClassification(BloomPreTrainedModel):
     ) -> Union[tuple[torch.Tensor], SequenceClassifierOutputWithPast]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values[0][0].shape[2]`
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values.get_seq_length()`
             (`sequence_length` of input past key value states). Indices of input sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1145,7 +1088,7 @@ class BloomForTokenClassification(BloomPreTrainedModel):
     ) -> Union[tuple[torch.Tensor], TokenClassifierOutput]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values[0][0].shape[2]`
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values.get_seq_length()`
             (`sequence_length` of input past key value states). Indices of input sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as
@@ -1236,7 +1179,7 @@ class BloomForQuestionAnswering(BloomPreTrainedModel):
     ) -> Union[tuple, QuestionAnsweringModelOutput]:
         r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values[0][0].shape[2]`
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values.get_seq_length()`
             (`sequence_length` of input past key value states). Indices of input sequence tokens in the vocabulary.
 
             If `past_key_values` is used, only `input_ids` that do not have their past calculated should be passed as

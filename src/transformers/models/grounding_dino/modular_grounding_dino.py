@@ -1,20 +1,18 @@
 from typing import TYPE_CHECKING, Optional, Union
 
+import torch
+
 from transformers.models.detr.image_processing_detr_fast import DetrImageProcessorFast
 
 from ...image_transforms import center_to_corners_format
 from ...utils import (
     TensorType,
-    is_torch_available,
     logging,
 )
 
 
 if TYPE_CHECKING:
     from .modeling_grounding_dino import GroundingDinoObjectDetectionOutput
-
-if is_torch_available():
-    import torch
 
 
 logger = logging.get_logger(__name__)
@@ -40,7 +38,7 @@ def _scale_boxes(boxes, target_sizes):
     elif isinstance(target_sizes, torch.Tensor):
         image_height, image_width = target_sizes.unbind(1)
     else:
-        raise ValueError("`target_sizes` must be a list, tuple or torch.Tensor")
+        raise TypeError("`target_sizes` must be a list, tuple or torch.Tensor")
 
     scale_factor = torch.stack([image_width, image_height, image_width, image_height], dim=1)
     scale_factor = scale_factor.unsqueeze(1).to(boxes.device)
@@ -102,25 +100,25 @@ class GroundingDinoImageProcessorFast(DetrImageProcessorFast):
 
         return results
 
-    def post_process():
+    def post_process(self):
         raise NotImplementedError("Post-processing is not implemented for Grounding-Dino yet.")
 
-    def post_process_segmentation():
+    def post_process_segmentation(self):
         raise NotImplementedError("Segmentation post-processing is not implemented for Grounding-Dino yet.")
 
-    def post_process_instance():
+    def post_process_instance(self):
         raise NotImplementedError("Instance post-processing is not implemented for Grounding-Dino yet.")
 
-    def post_process_panoptic():
+    def post_process_panoptic(self):
         raise NotImplementedError("Panoptic post-processing is not implemented for Grounding-Dino yet.")
 
-    def post_process_instance_segmentation():
+    def post_process_instance_segmentation(self):
         raise NotImplementedError("Segmentation post-processing is not implemented for Grounding-Dino yet.")
 
-    def post_process_semantic_segmentation():
+    def post_process_semantic_segmentation(self):
         raise NotImplementedError("Semantic segmentation post-processing is not implemented for Grounding-Dino yet.")
 
-    def post_process_panoptic_segmentation():
+    def post_process_panoptic_segmentation(self):
         raise NotImplementedError("Panoptic segmentation post-processing is not implemented for Grounding-Dino yet.")
 
 

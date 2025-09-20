@@ -24,11 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ...activations import ACT2FN
-from ...file_utils import (
-    ModelOutput,
-    is_timm_available,
-    requires_backends,
-)
+from ...file_utils import ModelOutput, is_timm_available, requires_backends
 from ...integrations import use_kernel_forward_from_hub
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import meshgrid
@@ -354,7 +350,7 @@ def replace_batch_norm(model):
         if isinstance(module, nn.BatchNorm2d):
             new_module = GroundingDinoFrozenBatchNorm2d(module.num_features)
 
-            if not module.weight.device == torch.device("meta"):
+            if module.weight.device != torch.device("meta"):
                 new_module.weight.data.copy_(module.weight)
                 new_module.bias.data.copy_(module.bias)
                 new_module.running_mean.data.copy_(module.running_mean)
@@ -865,11 +861,6 @@ def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = Fals
     """
     Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
-    Comment by Ross Wightman: This is the same as the DropConnect impl I created for EfficientNet, etc networks,
-    however, the original name is misleading as 'Drop Connect' is a different form of dropout in a separate paper...
-    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956 ... I've opted for changing the
-    layer and argument names to 'drop path' rather than mix DropConnect as a layer name and use 'survival rate' as the
-    argument.
     """
     if drop_prob == 0.0 or not training:
         return input
@@ -1183,11 +1174,6 @@ class GroundingDinoMultiheadAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_dropout)
 
-    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
     def forward(
         self,
         queries: torch.Tensor,
@@ -1196,9 +1182,18 @@ class GroundingDinoMultiheadAttention(nn.Module):
         attention_mask: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
-        query_layer = self.transpose_for_scores(self.query(queries))
-        key_layer = self.transpose_for_scores(self.key(keys))
-        value_layer = self.transpose_for_scores(self.value(values))
+        batch_size, seq_length, _ = queries.shape
+        query_layer = (
+            self.query(queries)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_layer = (
+            self.key(keys).view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        )
+        value_layer = (
+            self.value(values).view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        )
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -1369,7 +1364,7 @@ class GroundingDinoContrastiveEmbedding(nn.Module):
 
 @auto_docstring
 class GroundingDinoPreTrainedModel(PreTrainedModel):
-    config_class = GroundingDinoConfig
+    config: GroundingDinoConfig
     base_model_prefix = "model"
     main_input_name = "pixel_values"
 
@@ -1414,16 +1409,16 @@ class GroundingDinoPreTrainedModel(PreTrainedModel):
             module.out_vision_proj.bias.data.fill_(0)
             nn.init.xavier_uniform_(module.out_text_proj.weight)
             module.out_text_proj.bias.data.fill_(0)
-        elif isinstance(module, (GroundingDinoEncoderLayer, GroundingDinoDecoderLayer)):
-            for p in module.parameters():
-                if p.dim() > 1:
-                    nn.init.normal_(p, mean=0.0, std=std)
+        elif isinstance(module, GroundingDinoFusionLayer):
+            module.vision_param.data.fill_(1e-4)
+            module.text_param.data.fill_(1e-4)
         elif isinstance(module, (nn.Linear, nn.Conv2d, nn.BatchNorm2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
+        elif isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
+            module.weight.data.fill_(1.0)
+            module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
@@ -1872,7 +1867,7 @@ def generate_masks_with_special_tokens_and_transfer_map(input_ids: torch.LongTen
     # special_tokens_mask: batch_size, num_token. 1 for special tokens. 0 for normal tokens
     special_tokens_mask = torch.zeros((batch_size, num_token), device=input_ids.device).bool()
     for special_token in SPECIAL_TOKENS:
-        special_tokens_mask |= input_ids == special_token
+        special_tokens_mask = torch.logical_or(special_tokens_mask, input_ids == special_token)
 
     # idxs: each row is a list of indices of special tokens
     idxs = torch.nonzero(special_tokens_mask)
@@ -1974,12 +1969,6 @@ class GroundingDinoModel(GroundingDinoPreTrainedModel):
             self.reference_points = nn.Embedding(config.num_queries, 4)
 
         self.post_init()
-
-    def get_encoder(self):
-        return self.encoder
-
-    def get_decoder(self):
-        return self.decoder
 
     def freeze_backbone(self):
         for name, param in self.backbone.conv_encoder.model.named_parameters():

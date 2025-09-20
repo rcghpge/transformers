@@ -16,11 +16,8 @@ from ...activations import ACT2FN
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...utils import auto_docstring, can_return_tuple, logging, torch_int
+from ...utils import auto_docstring, can_return_tuple, torch_int
 from .configuration_multimodal2 import Multimodal2Config, Multimodal2TextConfig, Multimodal2VisionConfig
-
-
-logger = logging.get_logger(__name__)
 
 
 def eager_attention_forward(
@@ -100,13 +97,7 @@ class Multimodal2VisionAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and output_attentions:
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -196,13 +187,7 @@ class Multimodal2Attention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and output_attentions:
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -289,7 +274,6 @@ class Multimodal2VisionEncoder(nn.Module):
         self.layers = nn.ModuleList([Multimodal2VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
-    @can_return_tuple
     def forward(
         self,
         inputs_embeds,
@@ -455,7 +439,6 @@ class Multimodal2VisionTransformer(nn.Module):
         self.encoder = Multimodal2VisionEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
-    @can_return_tuple
     @auto_docstring
     def forward(
         self,
@@ -495,11 +478,11 @@ class Multimodal2VisionTransformer(nn.Module):
 
 @auto_docstring
 class Multimodal2VisionPreTrainedModel(PreTrainedModel):
-    config_class = Multimodal2Config
+    config: Multimodal2Config
     base_model_prefix = "multimodal2_vision"
     supports_gradient_checkpointing = True
     _supports_sdpa = True
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_flex_attn = True
     _supports_attention_backend = True
 
@@ -514,7 +497,7 @@ MULTIMODAL2_VISION_START_DOCSTRING = "doc"
 
 @add_start_docstrings("New doc", MULTIMODAL2_VISION_START_DOCSTRING)
 class Multimodal2VisionModel(Multimodal2VisionPreTrainedModel):
-    config_class = Multimodal2VisionConfig
+    config: Multimodal2VisionConfig
     main_input_name = "pixel_values"
     _no_split_modules = ["Multimodal2VisionEncoderLayer"]
 

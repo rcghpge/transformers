@@ -17,7 +17,6 @@ from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -28,7 +27,7 @@ from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from ...processing_utils import Unpack
-from ...utils import logging
+from ...utils import TransformersKwargs, logging
 from ...utils.deprecation import deprecate_kwarg
 from ..gemma.modeling_gemma import (
     GemmaAttention,
@@ -37,7 +36,9 @@ from ..gemma.modeling_gemma import (
     GemmaForTokenClassification,
     GemmaMLP,
     GemmaModel,
+    GemmaPreTrainedModel,
     GemmaRMSNorm,
+    GemmaRotaryEmbedding,
     apply_rotary_pos_emb,
     repeat_kv,
 )
@@ -200,7 +201,7 @@ class Gemma2Config(PretrainedConfig):
             self.layer_types = [
                 "sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types)
+        layer_type_validation(self.layer_types, self.num_hidden_layers)
 
 
 class Gemma2RMSNorm(GemmaRMSNorm):
@@ -209,8 +210,12 @@ class Gemma2RMSNorm(GemmaRMSNorm):
 
 class Gemma2MLP(GemmaMLP):
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         self.act_fn = ACT2FN[config.hidden_activation]
+
+
+class Gemma2RotaryEmbedding(GemmaRotaryEmbedding):
+    pass
 
 
 def eager_attention_forward(
@@ -257,12 +262,13 @@ class Gemma2Attention(GemmaAttention):
         self.scaling = config.query_pre_attn_scalar**-0.5
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
@@ -276,10 +282,10 @@ class Gemma2Attention(GemmaAttention):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
+        if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -317,14 +323,14 @@ class Gemma2DecoderLayer(GradientCheckpointingLayer):
         self.pre_feedforward_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_feedforward_layernorm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    @deprecate_kwarg("last_cache_position", version="4.53.0")
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -340,7 +346,7 @@ class Gemma2DecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -363,6 +369,10 @@ class Gemma2DecoderLayer(GradientCheckpointingLayer):
         return outputs
 
 
+class Gemma2PreTrainedModel(GemmaPreTrainedModel):
+    pass
+
+
 class Gemma2Model(GemmaModel):
     def __init__(self, config: Gemma2Config):
         super().__init__(config)
@@ -381,7 +391,7 @@ class Gemma2Model(GemmaModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -402,7 +412,7 @@ class Gemma2Model(GemmaModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None and not self.training:
-            past_key_values = DynamicCache()
+            past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -422,6 +432,7 @@ class Gemma2Model(GemmaModel):
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
+                "position_ids": position_ids,
             }
             # Create the masks
             causal_mask_mapping = {
@@ -454,11 +465,11 @@ class Gemma2Model(GemmaModel):
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
-                past_key_value=past_key_values,
+                past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                **flash_attn_kwargs,
+                **kwargs,
             )
 
             hidden_states = layer_outputs[0]
@@ -498,7 +509,7 @@ class Gemma2ForCausalLM(GemmaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **loss_kwargs,
+        **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
         Example:
@@ -518,11 +529,6 @@ class Gemma2ForCausalLM(GemmaForCausalLM):
         "What is your favorite condiment?"
         ```"""
 
-        if self.training and self.config._attn_implementation != "eager":
-            logger.warning_once(
-                "It is strongly recommended to train Gemma2 models with the `eager` attention implementation "
-                f"instead of `{self.config._attn_implementation}`. Use `eager` with `AutoModelForCausalLM.from_pretrained('<path-to-checkpoint>', attn_implementation='eager')`."
-            )
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -538,7 +544,7 @@ class Gemma2ForCausalLM(GemmaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
-            **loss_kwargs,
+            **kwargs,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -552,7 +558,7 @@ class Gemma2ForCausalLM(GemmaForCausalLM):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
+            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -564,17 +570,11 @@ class Gemma2ForCausalLM(GemmaForCausalLM):
 
 
 class Gemma2ForSequenceClassification(GemmaForSequenceClassification):
-    def __init__(self, config):
-        super().__init__(config)
-        self.model = Gemma2Model(config)
-        self.post_init()
+    pass
 
 
 class Gemma2ForTokenClassification(GemmaForTokenClassification):
-    def __init__(self, config):
-        super().__init__(config)
-        self.model = Gemma2Model(config)
-        self.post_init()
+    pass
 
 
 __all__ = [

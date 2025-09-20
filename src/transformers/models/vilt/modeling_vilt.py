@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
@@ -230,8 +229,6 @@ class TextEmbeddings(nn.Module):
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
@@ -328,17 +325,23 @@ class ViltSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
     def forward(self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False):
-        mixed_query_layer = self.query(hidden_states)
-
-        key_layer = self.transpose_for_scores(self.key(hidden_states))
-        value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        batch_size, seq_length, _ = hidden_states.shape
+        query_layer = (
+            self.query(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_layer = (
+            self.key(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(batch_size, -1, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -376,7 +379,7 @@ class ViltSelfOutput(nn.Module):
     layernorm applied before each block.
     """
 
-    def __init__(self, config: ViltConfig) -> None:
+    def __init__(self, config: ViltConfig):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -384,7 +387,6 @@ class ViltSelfOutput(nn.Module):
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-
         return hidden_states
 
 
@@ -424,7 +426,7 @@ class ViltAttention(nn.Module):
 
 # Copied from transformers.models.vit.modeling_vit.ViTIntermediate with ViT->Vilt
 class ViltIntermediate(nn.Module):
-    def __init__(self, config: ViltConfig) -> None:
+    def __init__(self, config: ViltConfig):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
@@ -435,13 +437,12 @@ class ViltIntermediate(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
-
         return hidden_states
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTOutput with ViT->Vilt
 class ViltOutput(nn.Module):
-    def __init__(self, config: ViltConfig) -> None:
+    def __init__(self, config: ViltConfig):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -449,9 +450,7 @@ class ViltOutput(nn.Module):
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-
         hidden_states = hidden_states + input_tensor
-
         return hidden_states
 
 
@@ -539,7 +538,7 @@ class ViltEncoder(nn.Module):
 
 @auto_docstring
 class ViltPreTrainedModel(PreTrainedModel):
-    config_class = ViltConfig
+    config: ViltConfig
     base_model_prefix = "vilt"
     supports_gradient_checkpointing = True
     _no_split_modules = ["ViltEmbeddings", "ViltSelfAttention"]
@@ -547,8 +546,6 @@ class ViltPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()

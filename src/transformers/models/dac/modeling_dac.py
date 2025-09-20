@@ -115,6 +115,7 @@ class DacVectorQuantize(nn.Module):
     def __init__(self, config: DacConfig):
         super().__init__()
 
+        self.codebook_dim = config.codebook_dim
         self.in_proj = nn.Conv1d(config.hidden_size, config.codebook_dim, kernel_size=1)
         self.out_proj = nn.Conv1d(config.codebook_dim, config.hidden_size, kernel_size=1)
         self.codebook = nn.Embedding(config.codebook_size, config.codebook_dim)
@@ -472,7 +473,7 @@ class DacEncoder(nn.Module):
 
 @auto_docstring
 class DacPreTrainedModel(PreTrainedAudioTokenizerBase):
-    config_class = DacConfig
+    config: DacConfig
     base_model_prefix = "dac"
     main_input_name = "input_values"
 
@@ -480,6 +481,12 @@ class DacPreTrainedModel(PreTrainedAudioTokenizerBase):
         if isinstance(module, nn.Conv1d):
             nn.init.trunc_normal_(module.weight, std=0.02)
             nn.init.constant_(module.bias, 0)
+        elif isinstance(module, Snake1d):
+            module.alpha.data.fill_(1.0)
+        elif isinstance(module, nn.ConvTranspose1d):
+            module.reset_parameters()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=0.02)
 
     def apply_weight_norm(self):
         weight_norm = nn.utils.weight_norm
@@ -607,6 +614,8 @@ class DacModel(DacPreTrainedModel):
             The codebook indices for each codebook, representing the quantized discrete
             representation of the input. This parameter should be provided if you want
             to decode directly from the audio codes (it will overwrite quantized_representation).
+        return_dict (`bool`, *optional*, defaults to `True`):
+            Whether to return a [`DacDecoderOutput`] instead of a plain tuple.
         """
 
         if quantized_representation is None and audio_codes is None:
@@ -661,6 +670,7 @@ class DacModel(DacPreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.return_dict
         length = input_values.shape[-1]
+
         loss, quantized_representation, audio_codes, projected_latents = self.encode(
             input_values, n_quantizers, return_dict=False
         )

@@ -16,7 +16,6 @@
 
 import copy
 import math
-import os
 import warnings
 from typing import Optional, Union
 
@@ -50,6 +49,7 @@ from ...utils import (
     is_torchdynamo_compiling,
     logging,
 )
+from ...utils.deprecation import deprecate_kwarg
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_mt5 import MT5Config
 
@@ -244,7 +244,6 @@ class MT5Attention(nn.Module):
                 "when creating this class."
             )
 
-        # Mesh TensorFlow initialization to avoid scaling before softmax
         self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
@@ -339,13 +338,14 @@ class MT5Attention(nn.Module):
         values = values.permute([2, 0, 1]).unsqueeze(0)  # shape (1, num_heads, query_length, key_length)
         return values
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states,
         mask=None,
         key_value_states=None,
         position_bias=None,
-        past_key_value=None,
+        past_key_values=None,
         layer_head_mask=None,
         query_length=None,
         use_cache=False,
@@ -365,34 +365,38 @@ class MT5Attention(nn.Module):
         query_states = self.q(hidden_states)
         query_states = query_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
 
-        if past_key_value is not None:
-            is_updated = past_key_value.is_updated.get(self.layer_idx)
+        # Check is encoder-decoder model is being used. Otherwise we'll get `DynamicCache`
+        is_updated = False
+        if isinstance(past_key_values, EncoderDecoderCache):
+            is_updated = past_key_values.is_updated.get(self.layer_idx)
             if is_cross_attention:
                 # after the first generated id, we can subsequently re-use all key/value_states from cache
-                curr_past_key_value = past_key_value.cross_attention_cache
+                curr_past_key_value = past_key_values.cross_attention_cache
             else:
-                curr_past_key_value = past_key_value.self_attention_cache
+                curr_past_key_value = past_key_values.self_attention_cache
+        else:
+            curr_past_key_value = past_key_values
 
         current_states = key_value_states if is_cross_attention else hidden_states
-        if is_cross_attention and past_key_value is not None and is_updated:
+        if is_cross_attention and past_key_values is not None and is_updated:
             # reuse k,v, cross_attentions
-            key_states = curr_past_key_value.key_cache[self.layer_idx]
-            value_states = curr_past_key_value.value_cache[self.layer_idx]
+            key_states = curr_past_key_value.layers[self.layer_idx].keys
+            value_states = curr_past_key_value.layers[self.layer_idx].values
         else:
             key_states = self.k(current_states)
             value_states = self.v(current_states)
             key_states = key_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
             value_states = value_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
 
-            if past_key_value is not None:
+            if past_key_values is not None:
                 # save all key/value_states to cache to be re-used for fast auto-regressive generation
                 cache_position = cache_position if not is_cross_attention else None
                 key_states, value_states = curr_past_key_value.update(
                     key_states, value_states, self.layer_idx, {"cache_position": cache_position}
                 )
                 # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
-                if is_cross_attention:
-                    past_key_value.is_updated[self.layer_idx] = True
+                if is_cross_attention and isinstance(past_key_values, EncoderDecoderCache):
+                    past_key_values.is_updated[self.layer_idx] = True
 
         # compute scores, equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
         scores = torch.matmul(query_states, key_states.transpose(3, 2))
@@ -440,7 +444,7 @@ class MT5Attention(nn.Module):
         attn_output = attn_output.view(batch_size, -1, self.inner_dim)
         attn_output = self.o(attn_output)
 
-        outputs = (attn_output, past_key_value, position_bias)
+        outputs = (attn_output, position_bias)
 
         if output_attentions:
             outputs = outputs + (attn_weights,)
@@ -457,13 +461,14 @@ class MT5LayerSelfAttention(nn.Module):
         self.layer_norm = MT5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states,
         attention_mask=None,
         position_bias=None,
         layer_head_mask=None,
-        past_key_value=None,
+        past_key_values=None,
         use_cache=False,
         output_attentions=False,
         cache_position=None,
@@ -474,7 +479,7 @@ class MT5LayerSelfAttention(nn.Module):
             mask=attention_mask,
             position_bias=position_bias,
             layer_head_mask=layer_head_mask,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             cache_position=cache_position,
@@ -492,6 +497,7 @@ class MT5LayerCrossAttention(nn.Module):
         self.layer_norm = MT5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states,
@@ -499,7 +505,7 @@ class MT5LayerCrossAttention(nn.Module):
         attention_mask=None,
         position_bias=None,
         layer_head_mask=None,
-        past_key_value=None,
+        past_key_values=None,
         use_cache=False,
         query_length=None,
         output_attentions=False,
@@ -512,7 +518,7 @@ class MT5LayerCrossAttention(nn.Module):
             key_value_states=key_value_states,
             position_bias=position_bias,
             layer_head_mask=layer_head_mask,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             use_cache=use_cache,
             query_length=query_length,
             output_attentions=output_attentions,
@@ -537,6 +543,7 @@ class MT5Block(GradientCheckpointingLayer):
 
         self.layer.append(MT5LayerFF(config))
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states,
@@ -547,7 +554,7 @@ class MT5Block(GradientCheckpointingLayer):
         encoder_decoder_position_bias=None,
         layer_head_mask=None,
         cross_attn_layer_head_mask=None,
-        past_key_value=None,
+        past_key_values=None,
         use_cache=False,
         output_attentions=False,
         return_dict=True,
@@ -558,13 +565,13 @@ class MT5Block(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             position_bias=position_bias,
             layer_head_mask=layer_head_mask,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             cache_position=cache_position,
         )
-        hidden_states, past_key_value = self_attention_outputs[:2]
-        attention_outputs = self_attention_outputs[2:]  # Keep self-attention outputs and relative position weights
+        hidden_states = self_attention_outputs[0]
+        attention_outputs = self_attention_outputs[1:]  # Keep self-attention outputs and relative position weights
 
         # clamp inf values to enable fp16 training
         if hidden_states.dtype == torch.float16:
@@ -583,12 +590,12 @@ class MT5Block(GradientCheckpointingLayer):
                 attention_mask=encoder_attention_mask,
                 position_bias=encoder_decoder_position_bias,
                 layer_head_mask=cross_attn_layer_head_mask,
-                past_key_value=past_key_value,
+                past_key_values=past_key_values,
                 query_length=cache_position[-1] + 1,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
             )
-            hidden_states, past_key_value = cross_attention_outputs[:2]
+            hidden_states = cross_attention_outputs[0]
 
             # clamp inf values to enable fp16 training
             if hidden_states.dtype == torch.float16:
@@ -600,7 +607,7 @@ class MT5Block(GradientCheckpointingLayer):
                 hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
 
             # Keep cross-attention outputs and relative position weights
-            attention_outputs = attention_outputs + cross_attention_outputs[2:]
+            attention_outputs = attention_outputs + cross_attention_outputs[1:]
 
         # Apply Feed Forward layer
         hidden_states = self.layer[-1](hidden_states)
@@ -616,118 +623,9 @@ class MT5Block(GradientCheckpointingLayer):
 
         outputs = (hidden_states,)
 
-        if use_cache:
-            outputs = outputs + (past_key_value,) + attention_outputs
-        else:
-            outputs = outputs + attention_outputs
-
-        return outputs  # hidden-states, past_key_value, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
-
-
-def load_tf_weights_in_mt5(model, config, tf_checkpoint_path):
-    """Load tf checkpoints in a pytorch model."""
-    try:
-        import re
-
-        import numpy as np
-        import tensorflow as tf
-    except ImportError:
-        logger.error(
-            "Loading a TensorFlow model in PyTorch, requires TensorFlow to be installed. Please see "
-            "https://www.tensorflow.org/install/ for installation instructions."
-        )
-        raise
-    tf_path = os.path.abspath(tf_checkpoint_path)
-    logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
-    # Load weights from TF model
-    init_vars = tf.train.list_variables(tf_path)
-    names = []
-    tf_weights = {}
-    for name, shape in init_vars:
-        logger.info(f"Loading TF weight {name} with shape {shape}")
-        array = tf.train.load_variable(tf_path, name)
-        names.append(name)
-        tf_weights[name] = array
-
-    for txt_name in names:
-        name = txt_name.split("/")
-        # adam_v and adam_m are variables used in AdamWeightDecayOptimizer to calculated m and v
-        # which are not required for using pretrained model
-        if any(
-            n in ["adam_v", "adam_m", "AdamWeightDecayOptimizer", "AdamWeightDecayOptimizer_1", "global_step"]
-            for n in name
-        ):
-            logger.info(f"Skipping {'/'.join(name)}")
-            tf_weights.pop(txt_name, None)
-            continue
-        if "_slot_" in name[-1]:
-            logger.info(f"Skipping {'/'.join(name)}")
-            tf_weights.pop(txt_name, None)
-            continue
-        pointer = model
-        array = tf_weights[txt_name]
-
-        for m_name in name:
-            if re.fullmatch(r"[A-Za-z]+_\d+", m_name):
-                scope_names = re.split(r"_(\d+)", m_name)
-            else:
-                scope_names = [m_name]
-            if scope_names[0] in ["kernel", "scale", "embedding"]:
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "self_attention":
-                pointer = getattr(pointer, "layer")
-                pointer = pointer[0]
-            elif scope_names[0] == "enc_dec_attention":
-                pointer = getattr(pointer, "layer")
-                pointer = pointer[1]
-            elif scope_names[0] == "dense_relu_dense":
-                pointer = getattr(pointer, "layer")
-                pointer = pointer[2]
-            elif scope_names[0] == "rms_norm":
-                if hasattr(pointer, "layer_norm"):
-                    pointer = getattr(pointer, "layer_norm")
-                elif hasattr(pointer, "final_layer_norm"):
-                    pointer = getattr(pointer, "final_layer_norm")
-            elif scope_names[0] == "scale":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "output_bias" or scope_names[0] == "beta":
-                pointer = getattr(pointer, "bias")
-            elif scope_names[0] == "squad":
-                pointer = getattr(pointer, "classifier")
-            elif scope_names[0] == "decoder" and name[1] == "logits":
-                continue
-            elif scope_names[0] == "logits":
-                pointer = getattr(pointer, "lm_head")
-            elif scope_names[0] == "wi" and len(scope_names) > 1 and scope_names[1].isdigit():
-                pointer = getattr(pointer, f"wi_{scope_names[1]}")
-                continue
-            else:
-                try:
-                    pointer = getattr(pointer, scope_names[0])
-                except AttributeError:
-                    logger.info(f"Skipping {'/'.join(name)}")
-                    continue
-            if len(scope_names) >= 2:
-                num = int(scope_names[1])
-                pointer = pointer[num]
-        if scope_names[0] not in ["kernel", "scale", "embedding"]:
-            pointer = getattr(pointer, "weight")
-        if scope_names[0] != "embedding":
-            logger.info(f"Transposing numpy weight of shape {array.shape} for {name}")
-            array = np.transpose(array)
-        try:
-            assert pointer.shape == array.shape, (
-                f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched"
-            )
-        except AssertionError as e:
-            e.args += (pointer.shape, array.shape)
-            raise
-        logger.info(f"Initialize PyTorch weight {name}")
-        pointer.data = torch.from_numpy(array.astype(np.float32))
-        tf_weights.pop(txt_name, None)
-
-    logger.info(f"Weights not copied to PyTorch model: {', '.join(tf_weights.keys())}.")
-    return model
+        return (
+            outputs + attention_outputs
+        )  # hidden-states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
 
 
 # Copied from transformers.models.t5.modeling_t5.T5ClassificationHead with T5->MT5
@@ -752,14 +650,12 @@ class MT5ClassificationHead(nn.Module):
 @auto_docstring
 # Copied from transformers.models.t5.modeling_t5.T5PreTrainedModel with T5->MT5, t5->mt5
 class MT5PreTrainedModel(PreTrainedModel):
-    config_class = MT5Config
-    load_tf_weights = load_tf_weights_in_mt5
+    config: MT5Config
     base_model_prefix = "transformer"
     is_parallelizable = True
     supports_gradient_checkpointing = True
-    _supports_quantized_cache = False  # enc-dec models don't support yet
-    _supports_static_cache = True
-    _supports_cache_class = True
+    _can_compile_fullgraph = True
+
     _no_split_modules = ["MT5Block"]
     _keep_in_fp32_modules = ["wo"]
 
@@ -783,8 +679,6 @@ class MT5PreTrainedModel(PreTrainedModel):
             module,
             (MT5Model, MT5ForConditionalGeneration, MT5EncoderModel, MT5ForQuestionAnswering),
         ):
-            # Mesh TensorFlow embeddings initialization
-            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L1624
             module.shared.weight.data.normal_(mean=0.0, std=factor * 1.0)
             if hasattr(module, "lm_head") and not self.config.tie_word_embeddings:
                 module.lm_head.weight.data.normal_(mean=0.0, std=factor * 1.0)
@@ -803,9 +697,6 @@ class MT5PreTrainedModel(PreTrainedModel):
             if hasattr(module.out_proj, "bias") and module.out_proj.bias is not None:
                 module.out_proj.bias.data.zero_()
         elif isinstance(module, MT5DenseActDense):
-            # Mesh TensorFlow FF initialization
-            # See https://github.com/tensorflow/mesh/blob/master/mesh_tensorflow/transformer/transformer_layers.py#L56
-            # and https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L89
             module.wi.weight.data.normal_(mean=0.0, std=factor * ((self.config.d_model) ** -0.5))
             if hasattr(module.wi, "bias") and module.wi.bias is not None:
                 module.wi.bias.data.zero_()
@@ -823,8 +714,6 @@ class MT5PreTrainedModel(PreTrainedModel):
             if hasattr(module.wo, "bias") and module.wo.bias is not None:
                 module.wo.bias.data.zero_()
         elif isinstance(module, MT5Attention):
-            # Mesh TensorFlow attention initialization to avoid scaling before softmax
-            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/attention.py#L136
             d_model = self.config.d_model
             key_value_proj_dim = self.config.d_kv
             n_heads = self.config.num_heads
@@ -899,7 +788,7 @@ class MT5Stack(MT5PreTrainedModel):
         )
         assert_device_map(self.device_map, len(self.block))
         self.model_parallel = True
-        self.first_device = "cpu" if "cpu" in self.device_map.keys() else "cuda:" + str(min(self.device_map.keys()))
+        self.first_device = "cpu" if "cpu" in self.device_map else "cuda:" + str(min(self.device_map.keys()))
         self.last_device = "cuda:" + str(max(self.device_map.keys()))
         # Load onto devices
         for k, v in self.device_map.items():
@@ -927,9 +816,6 @@ class MT5Stack(MT5PreTrainedModel):
         self.embed_tokens = self.embed_tokens.to("cpu")
         self.final_layer_norm = self.final_layer_norm.to("cpu")
         torch.cuda.empty_cache()
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
 
     def set_input_embeddings(self, new_embeddings):
         self.embed_tokens = new_embeddings
@@ -993,23 +879,14 @@ class MT5Stack(MT5PreTrainedModel):
             if not self.is_decoder:
                 raise ValueError(f"`use_cache` can only be set to `True` if {self} is used as a decoder")
 
-        # initialize past_key_values
-        return_legacy_cache = False
-        return_self_attention_cache = False
-        if self.is_decoder and (use_cache or past_key_values is not None):
-            if isinstance(past_key_values, Cache) and not isinstance(past_key_values, EncoderDecoderCache):
-                return_self_attention_cache = True
-                past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
-            elif not isinstance(past_key_values, EncoderDecoderCache):
-                return_legacy_cache = True
-                logger.warning_once(
-                    "Passing a tuple of `past_key_values` is deprecated and will be removed in Transformers v4.48.0. "
-                    "You should pass an instance of `EncoderDecoderCache` instead, e.g. "
-                    "`past_key_values=EncoderDecoderCache.from_legacy_cache(past_key_values)`."
-                )
-                past_key_values = EncoderDecoderCache.from_legacy_cache(past_key_values)
-            elif past_key_values is None:
-                past_key_values = EncoderDecoderCache(DynamicCache(), DynamicCache())
+        if self.is_decoder:
+            if use_cache and past_key_values is None:
+                if self.config.is_encoder_decoder:
+                    past_key_values = EncoderDecoderCache(
+                        DynamicCache(config=self.config), DynamicCache(config=self.config)
+                    )
+                else:
+                    past_key_values = DynamicCache(config=self.config)
         elif not self.is_decoder:
             # do not pass cache object down the line for encoder stack
             # it messes indexing later in decoder-stack because cache object is modified in-place
@@ -1031,7 +908,9 @@ class MT5Stack(MT5PreTrainedModel):
                 attention_mask,
                 inputs_embeds,
                 cache_position,
-                past_key_values.self_attention_cache if past_key_values is not None else None,
+                past_key_values.self_attention_cache
+                if isinstance(past_key_values, EncoderDecoderCache)
+                else past_key_values,
                 output_attentions,
             )
         elif attention_mask is not None:
@@ -1098,31 +977,26 @@ class MT5Stack(MT5PreTrainedModel):
                 encoder_decoder_position_bias,  # as a positional argument for gradient checkpointing
                 layer_head_mask=layer_head_mask,
                 cross_attn_layer_head_mask=cross_attn_layer_head_mask,
-                past_key_value=past_key_values,
+                past_key_values=past_key_values,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 return_dict=return_dict,
                 cache_position=cache_position,
             )
 
-            # layer_outputs is a tuple with:
-            # hidden-states, key-value-states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
-            if use_cache is False:
-                layer_outputs = layer_outputs[:1] + (None,) + layer_outputs[1:]
-
-            hidden_states, next_decoder_cache = layer_outputs[:2]
+            hidden_states = layer_outputs[0]
 
             # We share the position biases between the layers - the first layer store them
             # layer_outputs = hidden-states, key-value-states (self-attention position bias), (self-attention weights),
             # (cross-attention position bias), (cross-attention weights)
-            position_bias = layer_outputs[2]
+            position_bias = layer_outputs[1]
             if self.is_decoder and encoder_hidden_states is not None:
-                encoder_decoder_position_bias = layer_outputs[4 if output_attentions else 3]
+                encoder_decoder_position_bias = layer_outputs[3 if output_attentions else 2]
 
             if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[3],)
+                all_attentions = all_attentions + (layer_outputs[2],)
                 if self.is_decoder:
-                    all_cross_attentions = all_cross_attentions + (layer_outputs[5],)
+                    all_cross_attentions = all_cross_attentions + (layer_outputs[4],)
 
             # Model Parallel: If it's the last layer for that device, put things on the next device
             if self.model_parallel:
@@ -1137,18 +1011,12 @@ class MT5Stack(MT5PreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-        if return_self_attention_cache:
-            next_cache = past_key_values.self_attention_cache
-        if return_legacy_cache:
-            next_cache = past_key_values.to_legacy_cache()
-
         if not return_dict:
             return tuple(
                 v
                 for v in [
                     hidden_states,
-                    next_cache,
+                    past_key_values,
                     all_hidden_states,
                     all_attentions,
                     all_cross_attentions,
@@ -1157,7 +1025,7 @@ class MT5Stack(MT5PreTrainedModel):
             )
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             cross_attentions=all_cross_attentions,
@@ -1318,7 +1186,7 @@ class MT5Model(MT5PreTrainedModel):
     ```"""
 
     model_type = "mt5"
-    config_class = MT5Config
+    config: MT5Config
     _keys_to_ignore_on_load_unexpected = ["decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight"]
     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
 
@@ -1330,12 +1198,12 @@ class MT5Model(MT5PreTrainedModel):
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
-        encoder_config.is_encoder_decoder = False
+        encoder_config.tie_encoder_decoder = False
         self.encoder = MT5Stack(encoder_config, self.shared)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
-        decoder_config.is_encoder_decoder = False
+        decoder_config.tie_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = MT5Stack(decoder_config, self.shared)
 
@@ -1395,10 +1263,6 @@ class MT5Model(MT5PreTrainedModel):
     def get_encoder(self):
         return self.encoder
 
-    # Copied from transformers.models.t5.modeling_t5.T5Model.get_decoder
-    def get_decoder(self):
-        return self.decoder
-
     # Copied from transformers.models.t5.modeling_t5.T5Model._prune_heads
     def _prune_heads(self, heads_to_prune):
         """
@@ -1420,7 +1284,7 @@ class MT5Model(MT5PreTrainedModel):
         decoder_head_mask: Optional[torch.FloatTensor] = None,
         cross_attn_head_mask: Optional[torch.Tensor] = None,
         encoder_outputs: Optional[tuple[tuple[torch.FloatTensor]]] = None,
-        past_key_values: Optional[tuple[tuple[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         decoder_inputs_embeds: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
@@ -1585,7 +1449,7 @@ class MT5ForConditionalGeneration(MT5PreTrainedModel, GenerationMixin):
     ```"""
 
     model_type = "mt5"
-    config_class = MT5Config
+    config: MT5Config
     _keys_to_ignore_on_load_unexpected = ["decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight"]
     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"]
 
@@ -1599,12 +1463,12 @@ class MT5ForConditionalGeneration(MT5PreTrainedModel, GenerationMixin):
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
-        encoder_config.is_encoder_decoder = False
+        encoder_config.tie_encoder_decoder = False
         self.encoder = MT5Stack(encoder_config, self.shared)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
-        decoder_config.is_encoder_decoder = False
+        decoder_config.tie_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = MT5Stack(decoder_config, self.shared)
 
@@ -1654,31 +1518,17 @@ class MT5ForConditionalGeneration(MT5PreTrainedModel, GenerationMixin):
         self.device_map = None
         torch.cuda.empty_cache()
 
-    # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration.get_input_embeddings
     def get_input_embeddings(self):
         return self.shared
 
-    # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration.set_input_embeddings
     def set_input_embeddings(self, new_embeddings):
         self.shared = new_embeddings
         self.encoder.set_input_embeddings(new_embeddings)
         self.decoder.set_input_embeddings(new_embeddings)
 
-    # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration.set_output_embeddings
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration.get_output_embeddings
-    def get_output_embeddings(self):
-        return self.lm_head
-
     # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration.get_encoder
     def get_encoder(self):
         return self.encoder
-
-    # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration.get_decoder
-    def get_decoder(self):
-        return self.decoder
 
     @auto_docstring
     # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration.forward with google-t5/->google/, T5->MT5, t5->mt5
@@ -1692,7 +1542,7 @@ class MT5ForConditionalGeneration(MT5PreTrainedModel, GenerationMixin):
         decoder_head_mask: Optional[torch.FloatTensor] = None,
         cross_attn_head_mask: Optional[torch.Tensor] = None,
         encoder_outputs: Optional[tuple[tuple[torch.Tensor]]] = None,
-        past_key_values: Optional[tuple[tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1843,8 +1693,6 @@ class MT5ForConditionalGeneration(MT5PreTrainedModel, GenerationMixin):
             sequence_output = sequence_output.to(self.lm_head.weight.device)
 
         if self.config.tie_word_embeddings:
-            # Rescale output before projecting on vocab
-            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
             sequence_output = sequence_output * (self.model_dim**-0.5)
 
         lm_logits = self.lm_head(sequence_output)
@@ -1855,7 +1703,6 @@ class MT5ForConditionalGeneration(MT5PreTrainedModel, GenerationMixin):
             # move labels to correct device to enable PP
             labels = labels.to(lm_logits.device)
             loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
-            # TODO(thom): Add z_loss https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L666
 
         if not return_dict:
             output = (lm_logits,) + decoder_outputs[1:] + encoder_outputs
@@ -1877,37 +1724,6 @@ class MT5ForConditionalGeneration(MT5PreTrainedModel, GenerationMixin):
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
         return self._shift_right(labels)
 
-    # Copied from transformers.models.t5.modeling_t5.T5ForConditionalGeneration._reorder_cache
-    def _reorder_cache(self, past_key_values, beam_idx):
-        # if decoder past is not included in output
-        # speedy decoding is disabled and no need to reorder
-        if past_key_values is None:
-            logger.warning("You might want to consider setting `use_cache=True` to speed up decoding")
-            return past_key_values
-
-        reordered_decoder_past = ()
-        for layer_past_states in past_key_values:
-            # get the correct batch idx from layer past batch dim
-            # batch dim of `past` is at 2nd position
-            reordered_layer_past_states = ()
-            for layer_past_state in layer_past_states:
-                # need to set correct `past` for each of the four key / value states
-                reordered_layer_past_states = reordered_layer_past_states + (
-                    layer_past_state.index_select(0, beam_idx.to(layer_past_state.device)),
-                )
-
-            if reordered_layer_past_states[0].shape != layer_past_states[0].shape:
-                raise ValueError(
-                    f"reordered_layer_past_states[0] shape {reordered_layer_past_states[0].shape} and layer_past_states[0] shape {layer_past_states[0].shape} mismatched"
-                )
-            if len(reordered_layer_past_states) != len(layer_past_states):
-                raise ValueError(
-                    f"length of reordered_layer_past_states {len(reordered_layer_past_states)} and length of layer_past_states {len(layer_past_states)} mismatched"
-                )
-
-            reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
-        return reordered_decoder_past
-
 
 @auto_docstring
 class MT5EncoderModel(MT5PreTrainedModel):
@@ -1926,7 +1742,7 @@ class MT5EncoderModel(MT5PreTrainedModel):
     ```"""
 
     model_type = "mt5"
-    config_class = MT5Config
+    config: MT5Config
     _tied_weights_keys = ["encoder.embed_tokens.weight"]
 
     # Copied from transformers.models.t5.modeling_t5.T5EncoderModel.__init__ with T5->MT5
@@ -1934,7 +1750,7 @@ class MT5EncoderModel(MT5PreTrainedModel):
         super().__init__(config)
         self.shared = nn.Embedding(config.vocab_size, config.d_model)
 
-        encoder_config = copy.deepcopy(config)
+        encoder_config = config
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
         self.encoder = MT5Stack(encoder_config, self.shared)
@@ -2311,12 +2127,12 @@ class MT5ForQuestionAnswering(MT5PreTrainedModel):
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
-        encoder_config.is_encoder_decoder = False
+        encoder_config.tie_encoder_decoder = False
         self.encoder = MT5Stack(encoder_config, self.shared)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
-        decoder_config.is_encoder_decoder = False
+        decoder_config.tie_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = MT5Stack(decoder_config, self.shared)
 
@@ -2341,10 +2157,6 @@ class MT5ForQuestionAnswering(MT5PreTrainedModel):
     # Copied from transformers.models.t5.modeling_t5.T5ForQuestionAnswering.get_encoder
     def get_encoder(self):
         return self.encoder
-
-    # Copied from transformers.models.t5.modeling_t5.T5ForQuestionAnswering.get_decoder
-    def get_decoder(self):
-        return self.decoder
 
     @auto_docstring
     # Copied from transformers.models.t5.modeling_t5.T5ForQuestionAnswering.forward

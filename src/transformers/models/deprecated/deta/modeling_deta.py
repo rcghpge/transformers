@@ -326,8 +326,8 @@ class DetaObjectDetectionOutput(ModelOutput):
     encoder_last_hidden_state: Optional[torch.FloatTensor] = None
     encoder_hidden_states: Optional[tuple[torch.FloatTensor]] = None
     encoder_attentions: Optional[tuple[torch.FloatTensor]] = None
-    enc_outputs_class: Optional = None
-    enc_outputs_coord_logits: Optional = None
+    enc_outputs_class: Optional[torch.FloatTensor] = None
+    enc_outputs_coord_logits: Optional[torch.FloatTensor] = None
     output_proposals: Optional[torch.FloatTensor] = None
 
 
@@ -393,7 +393,7 @@ def replace_batch_norm(model):
         if isinstance(module, nn.BatchNorm2d):
             new_module = DetaFrozenBatchNorm2d(module.num_features)
 
-            if not module.weight.device == torch.device("meta"):
+            if module.weight.device != torch.device("meta"):
                 new_module.weight.data.copy_(module.weight)
                 new_module.bias.data.copy_(module.bias)
                 new_module.running_mean.data.copy_(module.running_mean)
@@ -789,6 +789,10 @@ class DetaMultiheadAttention(nn.Module):
                     f"Attention mask should be of size {(batch_size, 1, target_len, source_len)}, but is"
                     f" {attention_mask.size()}"
                 )
+            if attention_mask.dtype == torch.bool:
+                attention_mask = torch.zeros_like(attention_mask, dtype=attn_weights.dtype).masked_fill_(
+                    attention_mask, -torch.inf
+                )
             attn_weights = attn_weights.view(batch_size, self.num_heads, target_len, source_len) + attention_mask
             attn_weights = attn_weights.view(batch_size * self.num_heads, target_len, source_len)
 
@@ -1022,7 +1026,7 @@ class DetaDecoderLayer(GradientCheckpointingLayer):
 
 
 class DetaPreTrainedModel(PreTrainedModel):
-    config_class = DetaConfig
+    config: DetaConfig
     base_model_prefix = "model"
     main_input_name = "pixel_values"
     _no_split_modules = [r"DetaBackboneWithPositionalEncodings", r"DetaEncoderLayer", r"DetaDecoderLayer"]
@@ -1037,8 +1041,6 @@ class DetaPreTrainedModel(PreTrainedModel):
         elif isinstance(module, DetaMultiscaleDeformableAttention):
             module._reset_parameters()
         elif isinstance(module, (nn.Linear, nn.Conv2d, nn.BatchNorm2d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -1486,9 +1488,6 @@ class DetaModel(DetaPreTrainedModel):
     def get_encoder(self):
         return self.encoder
 
-    def get_decoder(self):
-        return self.decoder
-
     def freeze_backbone(self):
         for name, param in self.backbone.model.named_parameters():
             param.requires_grad_(False)
@@ -1856,7 +1855,7 @@ class DetaForObjectDetection(DetaPreTrainedModel):
 
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        self.class_embed.bias.data = torch.ones(config.num_labels) * bias_value
+        self.class_embed.bias.data.fill_(bias_value)
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
 
@@ -2042,7 +2041,7 @@ class DetaForObjectDetection(DetaPreTrainedModel):
                     aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
                 aux_weight_dict.update({k + "_enc": v for k, v in weight_dict.items()})
                 weight_dict.update(aux_weight_dict)
-            loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+            loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict)
 
         if not return_dict:
             if auxiliary_outputs is not None:

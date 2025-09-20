@@ -24,15 +24,12 @@ import numpy as np
 from ...image_utils import ImageInput
 from ...processing_utils import ImagesKwargs, ProcessingKwargs, ProcessorMixin
 from ...tokenization_utils_base import AudioInput, BatchEncoding, PreTokenizedInput, TextInput
-from ...utils import is_tf_available, is_torch_available
+from ...utils import is_torch_available
 from ...video_utils import VideoInput
 
 
 if is_torch_available():
     import torch
-
-if is_tf_available():
-    import tensorflow as tf
 
 
 class SamImagesKwargs(ImagesKwargs):
@@ -67,13 +64,6 @@ class SamProcessor(ProcessorMixin):
 
     attributes = ["image_processor"]
     image_processor_class = "SamImageProcessor"
-    # For backward compatibility. See transformers.processing_utils.ProcessorMixin.prepare_and_validate_optional_call_args for more details.
-    optional_call_args = [
-        "segmentation_maps",
-        "input_points",
-        "input_labels",
-        "input_boxes",
-    ]
 
     def __init__(self, image_processor):
         super().__init__(image_processor)
@@ -82,13 +72,6 @@ class SamProcessor(ProcessorMixin):
     def __call__(
         self,
         images: Optional[ImageInput] = None,
-        # The following is to capture `segmentation_maps`, `input_points`, `input_labels` and `input_boxes`
-        # arguments that may be passed as a positional argument.
-        # See transformers.processing_utils.ProcessorMixin.prepare_and_validate_optional_call_args for more details,
-        # or this conversation for more context:
-        # https://github.com/huggingface/transformers/pull/32544#discussion_r1720208116
-        # This behavior is only needed for backward compatibility and will be removed in future versions.
-        *args,  # to be deprecated
         text: Optional[Union[TextInput, PreTokenizedInput, list[TextInput], list[PreTokenizedInput]]] = None,
         audio: Optional[AudioInput] = None,
         video: Optional[VideoInput] = None,
@@ -102,7 +85,6 @@ class SamProcessor(ProcessorMixin):
             SamProcessorKwargs,
             tokenizer_init_kwargs={},
             **kwargs,
-            **self.prepare_and_validate_optional_call_args(*args),
         )
         input_points = output_kwargs["images_kwargs"].pop("input_points", None)
         input_labels = output_kwargs["images_kwargs"].pop("input_labels", None)
@@ -117,7 +99,7 @@ class SamProcessor(ProcessorMixin):
         # pop arguments that are not used in the forward but used nevertheless
         original_sizes = encoding_image_processor["original_sizes"]
 
-        if hasattr(original_sizes, "numpy"):  # Checks if Torch or TF tensor
+        if hasattr(original_sizes, "numpy"):
             original_sizes = original_sizes.numpy()
 
         input_points, input_labels, input_boxes = self._check_and_preprocess_points(
@@ -188,30 +170,18 @@ class SamProcessor(ProcessorMixin):
                 input_boxes = torch.from_numpy(input_boxes)
                 # boxes batch size of 1 by default
                 input_boxes = input_boxes.unsqueeze(1) if len(input_boxes.shape) != 3 else input_boxes
-            elif return_tensors == "tf":
-                input_boxes = tf.convert_to_tensor(input_boxes)
-                # boxes batch size of 1 by default
-                input_boxes = tf.expand_dims(input_boxes, 1) if len(input_boxes.shape) != 3 else input_boxes
             encoding_image_processor.update({"input_boxes": input_boxes})
         if input_points is not None:
             if return_tensors == "pt":
                 input_points = torch.from_numpy(input_points)
                 # point batch size of 1 by default
                 input_points = input_points.unsqueeze(1) if len(input_points.shape) != 4 else input_points
-            elif return_tensors == "tf":
-                input_points = tf.convert_to_tensor(input_points)
-                # point batch size of 1 by default
-                input_points = tf.expand_dims(input_points, 1) if len(input_points.shape) != 4 else input_points
             encoding_image_processor.update({"input_points": input_points})
         if input_labels is not None:
             if return_tensors == "pt":
                 input_labels = torch.from_numpy(input_labels)
                 # point batch size of 1 by default
                 input_labels = input_labels.unsqueeze(1) if len(input_labels.shape) != 3 else input_labels
-            elif return_tensors == "tf":
-                input_labels = tf.convert_to_tensor(input_labels)
-                # point batch size of 1 by default
-                input_labels = tf.expand_dims(input_labels, 1) if len(input_labels.shape) != 3 else input_labels
             encoding_image_processor.update({"input_labels": input_labels})
 
         return encoding_image_processor
@@ -265,7 +235,7 @@ class SamProcessor(ProcessorMixin):
         it is converted to a `numpy.ndarray` and then to a `list`.
         """
         if input_points is not None:
-            if hasattr(input_points, "numpy"):  # Checks for TF or Torch tensor
+            if hasattr(input_points, "numpy"):
                 input_points = input_points.numpy().tolist()
 
             if not isinstance(input_points, list) or not isinstance(input_points[0], list):
@@ -303,7 +273,7 @@ class SamProcessor(ProcessorMixin):
     @property
     def model_input_names(self):
         image_processor_input_names = self.image_processor.model_input_names
-        return list(dict.fromkeys(image_processor_input_names))
+        return list(image_processor_input_names + ["original_sizes", "reshaped_input_sizes"])
 
     def post_process_masks(self, *args, **kwargs):
         return self.image_processor.post_process_masks(*args, **kwargs)

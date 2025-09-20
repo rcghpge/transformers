@@ -21,7 +21,6 @@ from typing import Optional, Union
 
 import numpy as np
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss, LayerNorm
 
@@ -1183,7 +1182,7 @@ class SEWDEncoder(nn.Module):
 
 @auto_docstring
 class SEWDPreTrainedModel(PreTrainedModel):
-    config_class = SEWDConfig
+    config: SEWDConfig
     base_model_prefix = "sew-d"
     main_input_name = "input_values"
     supports_gradient_checkpointing = True
@@ -1198,8 +1197,6 @@ class SEWDPreTrainedModel(PreTrainedModel):
             )
             nn.init.constant_(module.conv.bias, 0)
         elif isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
             module.bias.data.zero_()
@@ -1597,9 +1594,10 @@ class SEWDForSequenceClassification(SEWDPreTrainedModel):
         r"""
         input_values (`torch.FloatTensor` of shape `(batch_size, sequence_length)`):
             Float values of input raw speech waveform. Values can be obtained by loading a `.flac` or `.wav` audio file
-            into an array of type `list[float]` or a `numpy.ndarray`, *e.g.* via the soundfile library (`pip install
-            soundfile`). To prepare the array into `input_values`, the [`AutoProcessor`] should be used for padding and
-            conversion into a tensor of type `torch.FloatTensor`. See [`SEWDProcessor.__call__`] for details.
+            into an array of type `list[float]`, a `numpy.ndarray` or a `torch.Tensor`, *e.g.* via the torchcodec library
+            (`pip install torchcodec`) or the soundfile library (`pip install soundfile`).
+            To prepare the array into `input_values`, the [`AutoProcessor`] should be used for padding and conversion
+            into a tensor of type `torch.FloatTensor`. See [`SEWDProcessor.__call__`] for details.
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If

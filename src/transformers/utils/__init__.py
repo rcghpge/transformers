@@ -21,7 +21,7 @@ from huggingface_hub.constants import HF_HUB_DISABLE_TELEMETRY as DISABLE_TELEME
 from packaging import version
 
 from .. import __version__
-from .args_doc import (
+from .auto_docstring import (
     ClassAttrs,
     ClassDocstring,
     ImageProcessorArgs,
@@ -47,23 +47,18 @@ from .doc import (
 from .generic import (
     ContextManagers,
     ExplicitEnum,
-    LossKwargs,
     ModelOutput,
     PaddingStrategy,
     TensorType,
-    cached_property,
+    TransformersKwargs,
     can_return_loss,
     can_return_tuple,
     expand_dims,
     filter_out_non_signature_kwargs,
     find_labels,
     flatten_dict,
-    infer_framework,
-    is_jax_tensor,
     is_numpy_array,
     is_tensor,
-    is_tf_symbolic_tensor,
-    is_tf_tensor,
     is_timm_config_dict,
     is_timm_local_checkpoint,
     is_torch_device,
@@ -117,9 +112,7 @@ from .import_utils import (
     ENV_VARS_TRUE_VALUES,
     GGUF_MIN_VERSION,
     TORCH_FX_REQUIRED_VERSION,
-    USE_JAX,
-    USE_TF,
-    USE_TORCH,
+    TRITON_MIN_VERSION,
     XLA_FSDPV2_MIN_VERSION,
     DummyObject,
     OptionalDependencyNotAvailable,
@@ -156,8 +149,8 @@ from .import_utils import (
     is_flash_attn_3_available,
     is_flash_attn_greater_or_equal,
     is_flash_attn_greater_or_equal_2_10,
-    is_flax_available,
     is_flute_available,
+    is_fp_quant_available,
     is_fsdp_available,
     is_ftfy_available,
     is_g2p_en_available,
@@ -171,17 +164,17 @@ from .import_utils import (
     is_huggingface_hub_greater_or_equal,
     is_in_notebook,
     is_ipex_available,
-    is_jieba_available,
     is_jinja_available,
     is_jumanpp_available,
     is_kenlm_available,
-    is_keras_nlp_available,
     is_kernels_available,
     is_levenshtein_available,
+    is_libcst_available,
     is_librosa_available,
     is_liger_kernel_available,
     is_lomo_available,
     is_matplotlib_available,
+    is_mistral_common_available,
     is_mlx_available,
     is_natten_available,
     is_ninja_available,
@@ -202,7 +195,9 @@ from .import_utils import (
     is_pytesseract_available,
     is_pytest_available,
     is_pytorch_quantization_available,
+    is_quanto_greater,
     is_quark_available,
+    is_qutlass_available,
     is_rich_available,
     is_rjieba_available,
     is_rocm_platform,
@@ -221,10 +216,6 @@ from .import_utils import (
     is_spqr_available,
     is_sudachi_available,
     is_sudachi_projection_available,
-    is_tensorflow_probability_available,
-    is_tensorflow_text_available,
-    is_tf2onnx_available,
-    is_tf_available,
     is_tiktoken_available,
     is_timm_available,
     is_tokenizers_available,
@@ -248,6 +239,7 @@ from .import_utils import (
     is_torch_musa_available,
     is_torch_neuroncore_available,
     is_torch_npu_available,
+    is_torch_optimi_available,
     is_torch_sdpa_available,
     is_torch_tensorrt_fx_available,
     is_torch_tf32_available,
@@ -263,9 +255,11 @@ from .import_utils import (
     is_torchvision_available,
     is_torchvision_v2_available,
     is_training_run_on_sagemaker,
+    is_triton_available,
     is_uroman_available,
     is_vision_available,
     is_vptq_available,
+    is_xlstm_available,
     is_yt_dlp_available,
     requires_backends,
     torch_only_method,
@@ -281,11 +275,6 @@ from .peft_utils import (
 
 WEIGHTS_NAME = "pytorch_model.bin"
 WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
-TF2_WEIGHTS_NAME = "tf_model.h5"
-TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
-TF_WEIGHTS_NAME = "model.ckpt"
-FLAX_WEIGHTS_NAME = "flax_model.msgpack"
-FLAX_WEIGHTS_INDEX_NAME = "flax_model.msgpack.index.json"
 SAFE_WEIGHTS_NAME = "model.safetensors"
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 CONFIG_NAME = "config.json"

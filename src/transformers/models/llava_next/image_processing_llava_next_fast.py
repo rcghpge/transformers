@@ -16,6 +16,8 @@
 
 from typing import Optional, Union
 
+import torch
+
 from ...image_processing_utils import BatchFeature, get_patch_output_size, select_best_resolution
 from ...image_processing_utils_fast import (
     BaseImageProcessorFast,
@@ -32,26 +34,19 @@ from ...image_utils import (
     PILImageResampling,
     SizeDict,
     get_image_size,
-    make_flat_list_of_images,
 )
 from ...processing_utils import Unpack
 from ...utils import (
     TensorType,
     auto_docstring,
-    is_torch_available,
-    is_torchvision_available,
     is_torchvision_v2_available,
 )
 
 
-if is_torch_available():
-    import torch
-
-if is_torchvision_available():
-    if is_torchvision_v2_available():
-        from torchvision.transforms.v2 import functional as F
-    else:
-        from torchvision.transforms import functional as F
+if is_torchvision_v2_available():
+    from torchvision.transforms.v2 import functional as F
+else:
+    from torchvision.transforms import functional as F
 
 
 class LlavaNextFastImageProcessorKwargs(DefaultFastImageProcessorKwargs):
@@ -60,13 +55,9 @@ class LlavaNextFastImageProcessorKwargs(DefaultFastImageProcessorKwargs):
         A list of possible resolutions to use for processing high resolution images. The best resolution is selected
         based on the original size of the image. Can be overridden by `image_grid_pinpoints` in the `preprocess`
         method.
-    do_pad (`bool`, *optional*):
-        Whether to pad the image. If `True`, will pad the patch dimension of the images in the batch to the largest
-        number of patches in the batch. Padding will be applied to the bottom and right with zeros.
     """
 
     image_grid_pinpoints: Optional[list[list[int]]]
-    do_pad: Optional[bool]
 
 
 @auto_docstring
@@ -94,22 +85,6 @@ class LlavaNextImageProcessorFast(BaseImageProcessorFast):
     @auto_docstring
     def preprocess(self, images: ImageInput, **kwargs: Unpack[LlavaNextFastImageProcessorKwargs]) -> BatchFeature:
         return super().preprocess(images, **kwargs)
-
-    def _prepare_images_structure(
-        self,
-        images: ImageInput,
-    ) -> ImageInput:
-        """
-        Prepare the images structure for processing.
-
-        Args:
-            images (`ImageInput`):
-                The input images to process.
-
-        Returns:
-            `ImageInput`: The images with a valid nesting.
-        """
-        return make_flat_list_of_images(images)
 
     def _resize_for_patching(
         self,

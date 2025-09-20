@@ -39,8 +39,7 @@ class RetriBertPreTrainedModel(PreTrainedModel):
     models.
     """
 
-    config_class = RetriBertConfig
-    load_tf_weights = None
+    config: RetriBertConfig
     base_model_prefix = "retribert"
 
     def _init_weights(self, module):

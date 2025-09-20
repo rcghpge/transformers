@@ -23,12 +23,12 @@ from ..deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3TopkRouter,
 )
 from ..qwen3.modeling_qwen3 import (
-    KwargsForCausalLM,
     Qwen3Attention,
     Qwen3ForCausalLM,
     Qwen3Model,
     Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
+    TransformersKwargs,
 )
 from .configuration_dots1 import Dots1Config
 
@@ -62,7 +62,7 @@ class Dots1TopkRouter(DeepseekV3TopkRouter):
 
 class Dots1DecoderLayer(DeepseekV3DecoderLayer):
     def __init__(self, config: Dots1Config, layer_idx: int):
-        super().__init__()
+        super().__init__(config, layer_idx)
         self.attention_type = config.layer_types[layer_idx]
 
 
@@ -77,7 +77,7 @@ class Dots1Model(Qwen3Model):
 class Dots1ForCausalLM(Qwen3ForCausalLM):
     def forward(
         self,
-        **super_kwargs: Unpack[KwargsForCausalLM],
+        **super_kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):

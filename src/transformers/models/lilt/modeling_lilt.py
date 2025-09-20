@@ -18,7 +18,6 @@ import math
 from typing import Optional, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
@@ -47,8 +46,6 @@ class LiltTextEmbeddings(nn.Module):
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -186,7 +183,7 @@ class LiltLayoutEmbeddings(nn.Module):
 
 
 class LiltSelfAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, position_embedding_type=None, layer_idx=None):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
@@ -221,6 +218,7 @@ class LiltSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.channel_shrink_ratio = config.channel_shrink_ratio
+        self.layer_idx = layer_idx
 
     def transpose_for_scores(self, x, r=1):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size // r)
@@ -338,9 +336,9 @@ class LiltSelfOutput(nn.Module):
 
 
 class LiltAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, position_embedding_type=None, layer_idx=None):
         super().__init__()
-        self.self = LiltSelfAttention(config, position_embedding_type=position_embedding_type)
+        self.self = LiltSelfAttention(config, position_embedding_type=position_embedding_type, layer_idx=layer_idx)
         self.output = LiltSelfOutput(config)
         self.pruned_heads = set()
 
@@ -421,11 +419,11 @@ class LiltOutput(nn.Module):
 
 
 class LiltLayer(GradientCheckpointingLayer):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = LiltAttention(config)
+        self.attention = LiltAttention(config, layer_idx=layer_idx)
         self.intermediate = LiltIntermediate(config)
         self.output = LiltOutput(config)
 
@@ -481,12 +479,10 @@ class LiltLayer(GradientCheckpointingLayer):
 
 
 class LiltEncoder(nn.Module):
-    # Copied from transformers.models.bert.modeling_bert.BertEncoder.__init__ with Bert->Lilt
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.layer = nn.ModuleList([LiltLayer(config) for _ in range(config.num_hidden_layers)])
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -559,7 +555,7 @@ class LiltPooler(nn.Module):
 
 @auto_docstring
 class LiltPreTrainedModel(PreTrainedModel):
-    config_class = LiltConfig
+    config: LiltConfig
     base_model_prefix = "lilt"
     supports_gradient_checkpointing = True
     _no_split_modules = []
@@ -567,8 +563,6 @@ class LiltPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
