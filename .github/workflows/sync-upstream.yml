@@ -51,7 +51,7 @@ jobs:
           echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
           echo "Behind by ${BEHIND} commit(s)."
 
-      - name: Configure git author
+      - name: Set GitHub permissions
         if: ${{ steps.detect.outputs.behind != '0' }}
         run: |
           git config user.name  "github-actions[bot]"
