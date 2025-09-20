@@ -25,6 +25,8 @@ limitations under the License.
 </p>
 
 <p align="center">
+    <a href="https://github.com/rcghpge/transformers/actions/workflows/sync-upstream.yml">
+  <img alt="Transformers Uptime" src="https://github.com/rcghpge/transformers/actions/workflows/sync-upstream.yml/badge.svg?branch=main&color=brightgreen"></a>
     <a href="https://huggingface.com/models"><img alt="Checkpoints on Hub" src="https://img.shields.io/endpoint?url=https://huggingface.co/api/shields/models&color=brightgreen"></a>
     <a href="https://circleci.com/gh/huggingface/transformers"><img alt="Build" src="https://img.shields.io/circleci/build/github/huggingface/transformers/main"></a>
     <a href="https://github.com/huggingface/transformers/blob/main/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/huggingface/transformers.svg?color=blue"></a>
