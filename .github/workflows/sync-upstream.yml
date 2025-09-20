@@ -1,0 +1,82 @@
+name: Transformers Uptime
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # Runs at midnight 00:00 UTC every Friday
+    # Thursday evening in US timezones
+    - cron: '0 0 * * 5'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-transformers
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Fork checks
+    if: ${{ github.repository == 'rcghpge/transformers' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Add remote and fetch
+        run: |
+          set -euo pipefail
+          # Add source tree. ignore if it exists
+          git remote add upstream https://github.com/huggingface/transformers.git 2>/dev/null || true
+          git fetch --prune origin
+          git fetch --prune upstream
+          git checkout main
+
+      - name: Check for diffs
+        id: detect
+        run: |
+          set -euo pipefail
+          BASE=$(git merge-base HEAD upstream/main || echo "")
+          if [ -n "$BASE" ]; then
+            BEHIND=$(git rev-list --right-only --count "${BASE}..upstream/main")
+          else
+            BEHIND=$(git rev-list --count upstream/main)
+          fi
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "Behind by ${BEHIND} commit(s)."
+
+      - name: Configure git author
+        if: ${{ steps.detect.outputs.behind != '0' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Merge upstream/main into main
+        if: ${{ steps.detect.outputs.behind != '0' }}
+        run: |
+          set -euo pipefail
+          # Merge (preserves history). CI rebasing is still wip
+          git merge --no-ff --no-edit upstream/main
+
+      - name: Push changes
+        if: ${{ steps.detect.outputs.behind != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin HEAD:main
+
+      # Optional: sync tags (disabled by default. todo - wip)
+      # - name: Push tags (optional)
+      #   if: ${{ steps.detect.outputs.behind != '0' }}
+      #   run: |
+      #     git fetch --tags upstream
+      #     git push --tags origin
