@@ -805,14 +805,7 @@ class SpeechT5TextDecoderPrenet(nn.Module, EmbeddingAccessMixin):
         else:
             raise ValueError("You have to specify `decoder_input_ids`")
 
-        past_key_values_length = 0
-        if past_key_values is not None:
-            past_key_values_length = (
-                past_key_values[0][0].shape[-2]
-                if not isinstance(past_key_values, Cache)
-                else past_key_values.get_seq_length()
-            )
-
+        past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
         positions = self.embed_positions(input_ids, past_key_values_length)
 
         inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
@@ -1174,6 +1167,7 @@ class SpeechT5PreTrainedModel(PreTrainedModel):
     config: SpeechT5Config
     base_model_prefix = "speecht5"
     main_input_name = "input_values"
+    input_modalities = "audio"
     supports_gradient_checkpointing = True
 
     def _init_weights(self, module: nn.Module):
@@ -2321,6 +2315,7 @@ def _generate_speech(
     """
 )
 class SpeechT5ForTextToSpeech(SpeechT5PreTrainedModel):
+    input_modalities = "text"
     main_input_name = "input_ids"
 
     def __init__(self, config: SpeechT5Config):
