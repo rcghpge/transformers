@@ -275,6 +275,7 @@ if TYPE_CHECKING:
     from .myt5 import *
     from .nanochat import *
     from .nemotron import *
+    from .nemotron_h import *
     from .nllb import *
     from .nllb_moe import *
     from .nougat import *
@@ -315,6 +316,7 @@ if TYPE_CHECKING:
     from .plbart import *
     from .poolformer import *
     from .pop2piano import *
+    from .pp_doclayout_v2 import *
     from .pp_doclayout_v3 import *
     from .prompt_depth_anything import *
     from .prophetnet import *
@@ -390,6 +392,7 @@ if TYPE_CHECKING:
     from .textnet import *
     from .time_series_transformer import *
     from .timesfm import *
+    from .timesfm2_5 import *
     from .timesformer import *
     from .timm_backbone import *
     from .timm_wrapper import *
@@ -402,6 +405,7 @@ if TYPE_CHECKING:
     from .univnet import *
     from .upernet import *
     from .vaultgemma import *
+    from .vibevoice_asr import *
     from .video_llama_3 import *
     from .video_llava import *
     from .videomae import *
